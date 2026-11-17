@@ -1,0 +1,1757 @@
+-- ============================================================
+--  HVH LITE v9.1  (penablox Lua API)   AA + Resolver + Smart HC + HUD-панель
+--
+--  Переписано с нуля из v7 (1860 строк -> ~800). Что исправлено:
+--   * РЕЗОЛЬВЕР НИЧЕГО НЕ ДЕЛАЛ: события aim_fire/aim_hit/aim_miss приходили, но цель события не
+--     находилась среди врагов (на HUD: MISS 0/0 при "why: resolver") -> обучение, замки, статистика
+--     не работали. Теперь выстрел привязывается по e.id, а цель ищется по ВСЕМ идентификаторам врага
+--     (объект / slot / Name / UserId / Character / поля таблицы), затем по e.point, затем по
+--     rage.get_target(). HUD показывает UNMATCHED, если что-то всё же не нашлось.
+--   * Встроенный резольвер по умолчанию НЕ отключается (plist работает поверх него, как в доке).
+--   * plist Force body yaw / Override yaw offset шлются КАЖДЫЙ тик (как в примере из доки).
+--   * Нигде нет varargs (`...`): движок Lua в игре на них падает.
+--   * AA: убрана "латч"-логика fake lag, самолечение через get_*, тоггл-мусор; оставлено то, что работает.
+--   * Вырезано: ui.reference-проба multipoint scale (всегда n/a), адаптация по inaccuracy,
+--     strictness/hoff/boff-слайдеры, автопресет при загрузке, шум в логе.
+--  Ошибки "Failed to load sound ... 6534946399" и "MeshContentProvider failed" в консоли Roblox -
+--  НЕ от скрипта: это пресет хитсаунда игры и CDN Roblox. Смени хитсаунд в меню игры.
+-- ============================================================
+
+--  v9 (поверх v8):
+--   * Резольвер больше НЕ забывает врага: при смерти/респавне/новом раунде чистится только "быстрая"
+--     история (углы, флипы), а выученные рабочие углы (LOCKED), счётчики и статистика остаются.
+--     Раньше scan() удалял состояние мёртвого врага -> каждая новая жизнь = брутфорс с нуля.
+--   * Safe point / baim включаются СРАЗУ против flip/rand/spin и при низкой уверенности (а не после
+--     промахов): меняем урон на гарантию попадания, без задержки выстрела.
+--   * Идентификатор врага = UserId (слоты переиспользуются). Ключ базы обновлён (старая статистика v7/v8
+--     могла быть отравлена).
+--   * Hitchance по умолчанию ниже (меньше "думает перед выстрелом"), головной MP отключается только
+--     при очень низкой уверенности, обновление HC 20 Гц.
+--   * Новая HUD-панель (Drawing: градиентная шапка, секции, бар уверенности), перерисовка только при
+--     изменении данных, пул объектов без аллокаций.
+local ICON  = "rbxassetid://10734975692"
+local clock = globals.realtime or os.clock
+local floor, abs, max, min, random = math.floor, math.abs, math.max, math.min, math.random
+local sin = math.sin
+
+local function wrap(a) return ((a + 180) % 360) - 180 end
+local function sgn(x) if x < 0 then return -1 end return 1 end
+local function round(x) return floor(x + 0.5) end
+local function clamp(x, lo, hi)
+    if x < lo then return lo elseif x > hi then return hi end
+    return x
+end
+local function prop(o, name)                       -- безопасное чтение поля (Instance кидает ошибку на чужое поле)
+    local ok, v = pcall(function() return o[name] end)
+    if ok then return v end
+    return nil
+end
+
+local COL = {
+    ok   = color(80, 235, 150),  warn = color(255, 196, 80),  bad = color(255, 92, 104),
+    dim  = color(132, 140, 166), txt  = color(226, 231, 246), acc = color(112, 132, 255),
+}
+local TICKS, STOPS, HUDS, SHARED = {}, {}, {}, {}
+local PRESET = {}
+local function reg(el, def) PRESET[#PRESET + 1] = { el = el, def = def }; return el end
+local function T(sec, name, def) return reg(sec:new_toggle(name, def), def) end
+local function S(sec, name, lo, hi, def, dec, suf) return reg(sec:new_slider(name, lo, hi, def, dec, suf), def) end
+local function C(sec, name, opts, def) return reg(sec:new_combobox(name, opts, def), def) end
+
+local ME = { alive = true, t = 0, me = nil, spawn = false }
+local function update_me(rt)
+    if rt < ME.t then return end
+    ME.t = rt + 0.1
+    local me = entity.get_local_player()
+    ME.me = me
+    if me == nil then ME.alive = true return end
+    local ok, a = pcall(entity.is_alive, me)
+    local alive = (not ok) or (a ~= false)
+    if alive and not ME.alive then ME.spawn = true end
+    ME.alive = alive
+end
+
+
+-- ============================================================
+--  PART 1: ANTI-AIM + DESYNC
+-- ============================================================
+do
+local real_aa = aa
+local FN, flags = {}, ""
+local function flag(name, mark)
+    local tag = " " .. name .. mark
+    if not string.find(flags, tag, 1, true) then flags = flags .. tag end
+end
+local function acall(name, a, b)                    -- максимум 2 аргумента, без varargs
+    local f = FN[name]
+    if f == nil then
+        f = real_aa[name]
+        if type(f) ~= "function" then f = false end
+        FN[name] = f
+    end
+    if not f then flag(name, "?") return nil end
+    local ok, r
+    if a == nil then ok, r = pcall(f)
+    elseif b == nil then ok, r = pcall(f, a)
+    else ok, r = pcall(f, a, b) end
+    if not ok then flag(name, "!") return nil end
+    return r
+end
+
+local tab  = menu.new_tab("HVH AA", ICON)
+local sec  = tab:new_section("Angles", "Left")
+local sec2 = tab:new_section("Desync / Fake Lag", "Right")
+local sec3 = tab:new_section("Defensive", "Right")
+
+local U = {}
+U.en       = T(sec, "Enable AA", true)
+U.pitch    = C(sec, "Pitch", { "Down", "Up", "Zero", "Disabled" }, "Down")
+U.base     = S(sec, "Yaw Base", -180, 180, 180, 0, "°")
+U.mod      = C(sec, "Yaw Modifier", { "Disabled", "Center", "Spin", "3-Way", "5-Way", "Random", "Sway" }, "Center")
+U.amt      = S(sec, "Modifier Amount", 0, 90, 40, 0, "°")
+U.spd      = S(sec, "Sway Speed", 1, 10, 2, 0, "x")
+U.mrand    = T(sec, "Randomize Modifier Amount", true)
+U.fake     = T(sec, "Show Fake (ghost)", true)
+
+U.limit    = S(sec2, "Desync Max", 0, 86, 86, 0, "°")
+U.rand     = T(sec2, "Randomize Desync", true)
+U.lmin     = S(sec2, "Desync Min", 0, 86, 60, 0, "°")
+U.lbias    = S(sec2, "Desync Bias To Max", 0, 100, 60, 0, "%")
+U.inv_mode = C(sec2, "Inverter Mode", { "Static", "Jitter", "Random", "Anti-Brute" }, "Anti-Brute")
+U.inv_key  = sec2:new_keybind("Invert Side", "Toggle", "F")
+U.inv_per  = S(sec2, "Inverter Period (packets)", 1, 16, 2, 0, "p")
+U.inv_rnd  = S(sec2, "Inverter Randomness", 0, 100, 50, 0, "%")
+U.lag      = T(sec2, "Fake Lag", true)
+U.lag_mode = C(sec2, "Fake Lag Mode", { "Maximum", "Fluctuate", "Random", "Adaptive" }, "Adaptive")
+U.lag_n    = S(sec2, "Fake Lag Limit", 0, 14, 12, 0, "t")
+U.lag_v    = S(sec2, "Fake Lag Variability", 0, 100, 40, 0, "%")
+U.lag_cap  = T(sec2, "Enforce Lag Cap (unchoke)", true)
+
+U.def      = T(sec3, "Defensive Flick", false)
+U.def_ev   = S(sec3, "Flick Every", 16, 128, 48, 0, "t")
+
+local A = {
+    on = false, was_dead = false, cfg_t = 0, force_t = 0, sig = nil, lsig = nil, ang_dirty = true,
+    cyc = 0, since = 0, ch = 0, ch_prev = 0, ch_last = nil, stuck = 0, own = 0, force_cycle = true,
+    inv = false, lim = 58, brute = false, rnd = false, next_flip = 0, next_lim = 0,
+    last_hp = nil, last_flip_t = 0, hit_t = 0, hits_recent = 0, panic_t = 0, hit_flag = false,
+    flick = false, next_flick = 0, sw = false, want = 1, tgt = nil, tgt_bad = 0, capped = false,
+    ap_inv = nil, ap_lim = nil, ap_lag_en = nil, ap_lag_lim = nil, ap_amt = nil,
+    amt_eff = nil, next_amt = 0, tw = nil, tw_t = 0, err = "",
+}
+local cfg = { en = false }
+local sway_fn, sway_k, sway_a
+
+local function load_cfg()
+    cfg.en       = U.en:get() and true or false
+    cfg.pitch    = U.pitch:get()
+    cfg.base     = U.base:get()
+    cfg.mod      = U.mod:get()
+    cfg.amt      = U.amt:get()
+    cfg.spd      = U.spd:get()
+    cfg.mrand    = U.mrand:get() and true or false
+    cfg.fake     = U.fake:get() and true or false
+    cfg.limit    = U.limit:get()
+    cfg.rand     = U.rand:get() and true or false
+    cfg.lmin     = U.lmin:get()
+    cfg.lbias    = U.lbias:get()
+    cfg.inv_mode = U.inv_mode:get()
+    cfg.inv_per  = max(1, floor(U.inv_per:get()))
+    cfg.inv_rnd  = U.inv_rnd:get()
+    cfg.lag      = U.lag:get() and true or false
+    cfg.lag_mode = U.lag_mode:get()
+    cfg.lag_n    = floor(U.lag_n:get())
+    cfg.lag_v    = U.lag_v:get()
+    cfg.lag_cap  = U.lag_cap:get() and true or false
+    cfg.def      = U.def:get() and true or false
+    cfg.def_ev   = floor(U.def_ev:get())
+    local sig = tostring(cfg.pitch) .. "|" .. tostring(cfg.base) .. "|" .. tostring(cfg.mod) .. "|"
+        .. tostring(cfg.amt) .. "|" .. tostring(cfg.spd) .. "|" .. tostring(cfg.mrand) .. "|" .. tostring(cfg.fake)
+    if sig ~= A.sig then A.sig = sig; A.ang_dirty = true; A.amt_eff = nil; A.next_amt = 0 end
+    local lsig = tostring(cfg.lag) .. "|" .. tostring(cfg.lag_n) .. "|" .. tostring(cfg.lag_mode)
+    if lsig ~= A.lsig then A.lsig = lsig; A.ap_lag_en, A.ap_lag_lim = nil, nil; A.tgt_bad, A.capped = 0, false end
+end
+
+local function roll_period(base, var)
+    local p = base * (1 + (random() * 2 - 1) * var / 100)
+    return max(1, round(p))
+end
+
+-- ---------- каналы ----------
+local function apply_modifier()
+    local m, amt = cfg.mod, cfg.amt
+    if cfg.mrand and A.amt_eff and m ~= "Spin" then amt = A.amt_eff end
+    A.ap_amt = amt
+    if m == "Sway" then
+        if not sway_fn or sway_k ~= cfg.spd or sway_a ~= amt then
+            sway_k, sway_a = cfg.spd, amt
+            local k, a = cfg.spd * 0.1, amt
+            sway_fn = function(t, by) return sin(t * k) * a end
+        end
+        acall("override_yaw_modifier", sway_fn)
+    elseif m == "Disabled" then
+        acall("override_yaw_modifier", "Disabled")
+    else
+        acall("override_yaw_modifier", m, amt)
+    end
+end
+
+local function apply_angles()
+    A.ang_dirty = false
+    if not A.flick then
+        acall("override_pitch", cfg.pitch)
+        acall("override_yaw_offset", 0)
+    end
+    acall("override_yaw", cfg.base, "camera")
+    apply_modifier()
+    acall("override_body_yaw", true)
+    acall("override_show_fake", cfg.fake)
+end
+
+local function next_lag()
+    local L, m = cfg.lag_n, cfg.lag_mode
+    if m == "Maximum" then return L end
+    if m == "Fluctuate" then return random(max(1, round(L * (1 - cfg.lag_v / 100))), L) end
+    if m == "Random" then return random(1, L) end
+    -- Adaptive: в воздухе / на бегу длинный лаг, на месте короткий
+    local spd, ground = 0, true
+    local ok1, s1 = pcall(movement.get_speed)
+    if ok1 and type(s1) == "number" then spd = s1 end
+    local ok2, g2 = pcall(movement.is_grounded)
+    if ok2 and g2 == false then ground = false end
+    if not ground then return L end
+    if spd > 6 then return random(max(1, round(L * 0.6)), L) end
+    return random(max(1, round(L / 4)), max(2, round(L / 2)))
+end
+
+local function end_flick()
+    if A.flick then
+        A.flick = false
+        acall("override_pitch", cfg.pitch)
+        acall("override_yaw_offset", 0)
+    end
+end
+
+-- попали по нам -> меняем сторону (проверка каждый тик)
+local function check_hit(rt)
+    if cfg.inv_mode ~= "Anti-Brute" then A.last_hp = nil return end
+    local me = ME.me
+    if me == nil then return end
+    local hp = entity.get_player_health(me)
+    if type(hp) ~= "number" then return end
+    if A.last_hp and hp < A.last_hp and hp > 0 and (rt - A.last_flip_t) > 0.12 then
+        A.brute = not A.brute
+        A.last_flip_t = rt
+        A.hit_flag = true
+        A.next_lim = 0
+        if rt - A.hit_t < 3 then A.hits_recent = A.hits_recent + 1 else A.hits_recent = 1 end
+        A.hit_t = rt
+        if A.hits_recent >= 2 then A.panic_t = rt + 3 end        -- бьют по паттерну: 3 с рандома
+    end
+    A.last_hp = hp
+end
+
+-- начало нового цикла choke (= новый реально отправляемый пакет)
+local function new_cycle(rt, tk)
+    A.cyc = A.cyc + 1
+    A.since = 0
+
+    -- 1) fake lag
+    if cfg.lag and cfg.lag_n >= 1 then
+        if A.ap_lag_en ~= true then
+            A.ap_lag_en = true
+            acall("override_fake_lag", true)
+            acall("override_fake_lag_variability", 0)       -- разброс делаем сами
+            A.ap_lag_lim = nil
+        end
+        A.want = round(next_lag())
+        if A.ap_lag_lim ~= A.want then A.ap_lag_lim = A.want; acall("override_fake_lag_limit", A.want) end
+    else
+        if A.ap_lag_en ~= false then A.ap_lag_en = false; acall("override_fake_lag", false) end
+        A.want = 1
+    end
+
+    -- 2) inverter
+    local mode   = cfg.inv_mode
+    local manual = U.inv_key:get() and true or false
+    local inv
+    if mode == "Static" then
+        inv = manual
+    elseif mode == "Jitter" then
+        inv = ((floor(A.cyc / cfg.inv_per) % 2) == 1) ~= manual
+    elseif mode == "Random" then
+        if A.cyc >= A.next_flip then
+            A.rnd = not A.rnd
+            A.next_flip = A.cyc + roll_period(cfg.inv_per, cfg.inv_rnd)
+        end
+        inv = (A.rnd ~= manual)
+    else -- Anti-Brute
+        if rt < A.panic_t then
+            if A.cyc >= A.next_flip then
+                A.rnd = not A.rnd
+                A.next_flip = A.cyc + roll_period(max(floor(cfg.inv_per / 2), 1), 60)
+            end
+            inv = (A.rnd ~= manual)
+        else
+            inv = (A.brute ~= manual)
+        end
+    end
+    local flipped = (inv ~= A.inv)
+    A.inv = inv
+
+    -- 3) лимит desync (бросок смещён к максимуму)
+    local maxl, lim = cfg.limit, nil
+    if cfg.rand then
+        local mn = min(cfg.lmin, maxl)
+        if flipped or A.cyc >= A.next_lim or A.lim > maxl or A.lim < mn then
+            local u = random() ^ (1 + 2 * (cfg.lbias / 100))
+            A.lim = clamp(round(maxl - (maxl - mn) * u), mn, maxl)
+            A.next_lim = A.cyc + random(2, 5)
+        end
+        lim = A.lim
+    else
+        lim = maxl
+        A.lim = maxl
+    end
+
+    -- 4) разброс амплитуды модификатора
+    if cfg.mrand and cfg.mod ~= "Spin" and cfg.mod ~= "Disabled" and cfg.amt > 0 then
+        if A.hit_flag or A.cyc >= A.next_amt then
+            local lo = max(0, floor(cfg.amt * 0.6))
+            local hi = max(lo, min(90, floor(cfg.amt * 1.25)))
+            A.amt_eff = random(lo, hi)
+            A.next_amt = A.cyc + random(3, 7)
+            if A.amt_eff ~= A.ap_amt then apply_modifier() end
+        end
+    elseif A.amt_eff then
+        A.amt_eff = nil
+        if A.ap_amt ~= cfg.amt then apply_modifier() end
+    end
+    A.hit_flag = false
+
+    -- 5) defensive flick: ровно один цикл, потом возврат
+    if cfg.def then
+        if A.flick then
+            end_flick()
+        elseif tk >= A.next_flick then
+            A.next_flick = tk + roll_period(max(cfg.def_ev, 2), 40)
+            A.flick = true
+            acall("override_pitch", random(0, 1) == 0 and -89 or 89)
+            acall("override_yaw_offset", random(120, 180) * (random(0, 1) == 0 and -1 or 1))
+        end
+    else
+        end_flick()
+    end
+
+    -- 6) отправляем только изменившееся
+    if A.ap_inv ~= inv then A.ap_inv = inv; acall("override_inverter", inv) end
+    if A.ap_lim ~= lim then A.ap_lim = lim; acall("override_desync_limits", lim, lim) end
+end
+
+local function reset_cache()
+    A.ap_inv, A.ap_lim, A.ap_lag_en, A.ap_lag_lim = nil, nil, nil, nil
+    A.ang_dirty, A.force_cycle = true, true
+    A.cyc, A.since, A.stuck, A.own, A.ch_prev, A.ch_last = 0, 0, 0, 0, 0, nil
+    A.next_flip, A.next_lim, A.next_flick = 0, 0, 0
+    A.last_hp, A.hits_recent, A.panic_t, A.hit_t = nil, 0, 0, 0
+    A.flick, A.tgt_bad, A.capped = false, 0, false
+    A.next_amt, A.amt_eff, A.ap_amt, A.hit_flag = 0, nil, nil, false
+end
+
+local function aa_tick()
+    local rt = clock()
+    if rt >= A.cfg_t then load_cfg(); A.cfg_t = rt + 0.25 end
+
+    if not cfg.en then
+        if A.on then acall("reset"); A.on = false; reset_cache() end
+        return
+    end
+    if not ME.alive then A.was_dead = true; return end        -- мёртв -> молчим
+    if A.was_dead then A.was_dead = false; reset_cache() end  -- респавн -> всё заново
+
+    local tk = globals.tickcount()
+    if not A.on then A.on = true; reset_cache(); A.next_flick = tk + 24 end
+
+    -- раз в 0.5 с принудительно переотправляем (движок мог сбросить overrides)
+    if rt >= A.force_t then
+        A.force_t = rt + 0.5
+        A.ang_dirty = true
+        A.ap_inv, A.ap_lim = nil, nil
+    end
+    if A.ang_dirty then apply_angles() end
+    check_hit(rt)
+
+    -- определяем начало нового цикла choke
+    local lag_on = cfg.lag and cfg.lag_n >= 1
+    local ch = acall("get_choked_ticks")
+    local cyc = false
+    if A.force_cycle then
+        cyc, A.force_cycle = true, false
+    elseif not lag_on then
+        cyc = true
+    elseif type(ch) == "number" then
+        if ch == A.ch_last then A.stuck = A.stuck + 1 else A.stuck = 0 end
+        A.ch_last = ch
+        if A.stuck > 24 then                          -- счётчик движка завис -> считаем сами
+            A.own = A.own + 1
+            if A.own >= A.want then cyc, A.own = true, 0 end
+        else
+            A.own = 0
+            cyc = (ch == 0) or (ch < A.ch_prev)
+        end
+    else
+        A.own = A.own + 1
+        if A.own >= A.want then cyc, A.own = true, 0 end
+    end
+    if type(ch) == "number" then A.ch_prev = ch; A.ch = floor(ch) end
+
+    if cyc then new_cycle(rt, tk) else A.since = A.since + 1 end
+
+    -- движок держит наш лимит? если нет (target больше нашего) - режем сами через unchoke
+    if lag_on and A.since == 1 then
+        local tgt = acall("get_choke_target")
+        if type(tgt) == "number" then
+            A.tgt = round(tgt)
+            if abs(A.tgt - A.want) <= 1 then A.tgt_bad, A.capped = 0, false
+            else
+                A.tgt_bad = A.tgt_bad + 1
+                if A.tgt_bad >= 4 then A.capped = (A.tgt > A.want) end
+            end
+        end
+    end
+    if lag_on and cfg.lag_cap and A.capped and A.ch >= A.want then acall("unchoke") end
+
+    if rt >= A.tw_t then
+        A.tw_t = rt + 0.4
+        local tw = acall("get_twist_deg")
+        A.tw = (type(tw) == "number") and round(tw) or nil
+    end
+end
+
+TICKS[#TICKS + 1] = function()
+    local ok, e = pcall(aa_tick)
+    if not ok then A.err = string.sub(tostring(e), -90) end
+end
+
+HUDS[#HUDS + 1] = { name = "Anti-Aim", fn = function()
+    if not cfg.en then return nil end
+    local rows = {}
+    rows[1] = { "Desync", round(A.lim) .. "°  real " .. (A.inv and "L" or "R") .. "  " .. cfg.mod .. " "
+        .. tostring(A.ap_amt or cfg.amt) .. "°", COL.txt }
+    local lag = "off"
+    if cfg.lag and cfg.lag_n >= 1 then
+        lag = cfg.lag_mode .. " " .. A.ch .. "/" .. A.want .. (A.capped and " cap" or "")
+    end
+    rows[2] = { "Lag", lag .. (A.tw and ("  tw " .. A.tw .. "°") or "") .. (A.flick and "  FLICK" or ""),
+                A.flick and COL.warn or COL.txt }
+    if flags ~= "" then rows[#rows + 1] = { "API", flags, COL.warn } end
+    if A.err ~= "" then rows[#rows + 1] = { "ERR", A.err, COL.bad } end
+    return { title = "ANTI-AIM", rows = rows }
+end }
+
+client.set_event_callback("round_start", function() if A.on then reset_cache() end end)
+STOPS[#STOPS + 1] = function() acall("reset") end
+end -- PART 1
+
+
+-- ============================================================
+--  PART 2: RESOLVER
+-- ============================================================
+do
+local _gs = entity.get_player_slot
+local function get_slot(p)
+    if _gs then
+        local ok, s = pcall(_gs, p)
+        if ok and s ~= nil then return s end
+    end
+    return nil
+end
+local function sid_of(e)                              -- стабильный id врага: UserId -> slot -> Name (слоты переиспользуются)
+    local u = prop(e, "UserId")
+    if u ~= nil then return u end
+    local s = get_slot(e)
+    if s ~= nil then return s end
+    local n = prop(e, "Name")
+    if n ~= nil then return n end
+    return e
+end
+
+local tab  = menu.new_tab("HVH Resolver", ICON)
+local secm = tab:new_section("Main", "Left")
+local secs = tab:new_section("Spread / Learning", "Left")
+
+local U = {}
+U.en        = T(secm, "Enable Resolver", true)
+U.auto_off  = T(secm, "Disable Built-in Resolver", false)
+U.baim      = S(secm, "BAim After Misses", 1, 6, 2, 0, " miss")
+U.step      = S(secm, "Miss Step", 1, 5, 1, 0, " miss")
+U.reset_hit = T(secm, "Reset Misses On Hit", true)
+U.per_state = T(secm, "Separate Memory Per Move State", true)
+U.def       = T(secm, "Defensive Detect (force BAim)", true)
+U.pitch     = T(secm, "Force Enemy Pitch Down", false)
+U.smart_baim = T(secm, "Smart BAim vs hard AA (flip/rand)", true)
+U.meas_on   = T(secm, "Use Measured Desync", true)
+U.meas_src  = C(secm, "Measured Source", { "Auto", "Feet", "Desync" }, "Auto")
+U.pred      = T(secm, "Predict Flip Side (jitter AA)", true)
+U.sp_hard   = T(secm, "Safe Point vs flip/rand/spin (until proven)", true)
+U.sp_conf   = S(secm, "Safe Point if confidence below", 0, 100, 30, 0, "%")
+U.spr_res   = T(secs, "Spread Miss = Resolver Miss", true)
+U.spr_hc    = S(secs, "If shot HC >=", 0, 100, 50, 0, "%")
+U.learn     = T(secs, "Learn Across Sessions", true)
+U.dbg       = T(secs, "Debug Log (console)", false)
+
+local c = { en = true }
+local builtin_prev = nil
+local function builtin_off()
+    if builtin_prev == nil and rage.is_resolver_enabled and rage.set_resolver_enabled then
+        local ok, cur = pcall(rage.is_resolver_enabled)
+        if ok then
+            builtin_prev = cur and true or false
+            pcall(rage.set_resolver_enabled, false)
+        end
+    end
+end
+local function builtin_restore()
+    if builtin_prev ~= nil then
+        pcall(rage.set_resolver_enabled, builtin_prev)
+        builtin_prev = nil
+    end
+end
+
+local function load_cfg()
+    c.en        = U.en:get() and true or false
+    c.auto_off  = U.auto_off:get() and true or false
+    c.baim      = U.baim:get()
+    c.step      = U.step:get()
+    c.reset_hit = U.reset_hit:get() and true or false
+    c.per_state = U.per_state:get() and true or false
+    c.def       = U.def:get() and true or false
+    c.pitch     = U.pitch:get() and true or false
+    c.smart_baim = U.smart_baim:get() and true or false
+    c.meas_on   = U.meas_on:get() and true or false
+    c.src       = U.meas_src:get()
+    c.pred      = U.pred:get() and true or false
+    c.sp_hard   = U.sp_hard:get() and true or false
+    c.sp_conf   = U.sp_conf:get()
+    c.spr_res   = U.spr_res:get() and true or false
+    c.spr_hc    = U.spr_hc:get()
+    c.learn     = U.learn:get() and true or false
+    c.dbg       = U.dbg:get() and true or false
+    if c.en and c.auto_off then builtin_off() else builtin_restore() end
+end
+
+-- ---------- обучение: gstats[kind][rel] = {h, s} (общий приор) + mem[id].stats (по врагу) ----------
+local STATS_KEY = "hvh_lite_stats_v9"
+local gstats = {}
+do
+    local ok, saved = pcall(function() return database.read(STATS_KEY) end)
+    if ok and type(saved) == "table" then gstats = saved end
+end
+local mem = {}
+local function save_stats()
+    pcall(function() database.write(STATS_KEY, gstats); database.flush() end)
+end
+
+local KEY = setmetatable({}, { __index = function(t, k) local s = tostring(k); t[k] = s; return s end })
+local function entry(tbl, kind, key)
+    local kt = tbl[kind]
+    if type(kt) ~= "table" then kt = {}; tbl[kind] = kt end
+    local e = kt[key]
+    if type(e) ~= "table" then e = { h = 0, s = 0 }; kt[key] = e end
+    return e
+end
+local function credit(st, kind, rel, hit)
+    local k = KEY[rel]
+    local e = entry(st.m.stats, kind, k)
+    e.s = e.s + 1
+    if hit then e.h = e.h + 1 end
+    if e.s > 30 then e.h = e.h * 0.5; e.s = e.s * 0.5 end
+    local g = entry(gstats, kind, k)
+    g.s = g.s + 1
+    if hit then g.h = g.h + 1 end
+    if g.s > 60 then g.h = g.h * 0.5; g.s = g.s * 0.5 end
+end
+local function score(st, kind, rel)
+    local k = KEY[rel]
+    local gk = gstats[kind]
+    local g = gk and gk[k]
+    local pg = g and ((g.h + 1) / (g.s + 2)) or 0.5
+    local sk = st.m.stats[kind]
+    local e = sk and sk[k]
+    if not e then return pg end
+    return (e.h + 2 * pg) / (e.s + 2)
+end
+
+-- ---------- кандидаты: числа умножаются на сторону desync врага ----------
+local MEAS, MEAS_INV, MAXD, MAXDN, PRED, MID = 999, 998, 997, 996, 995, 994
+local function needs_meas(r) return r == MEAS or r == MEAS_INV or r == PRED end
+local ORDER = {
+    static  = { MEAS, MAXD, MEAS_INV, 0, MAXDN, 86, -86, 58, -58, 30, -30 },
+    flip    = { PRED, MEAS_INV, MEAS, MAXD, MAXDN, 0, 58, -58, 86, -86, 30, -30 },
+    rand    = { MID, MAXD, MAXDN, MEAS, MEAS_INV, 0, 58, -58, 86, -86, 30, -30 },
+    spin    = { MEAS, 0, MAXD, MAXDN, 86, -86, MEAS_INV, 58, -58, 30, -30 },
+    unknown = { MEAS, MAXD, MEAS_INV, 0, MAXDN, 86, -86, 58, -58, 30, -30 },
+}
+local function rel_name(r)
+    if r == MEAS then return "meas" end
+    if r == MEAS_INV then return "-meas" end
+    if r == MAXD then return "max" end
+    if r == MAXDN then return "-max" end
+    if r == PRED then return "pred" end
+    if r == MID then return "mid" end
+    return tostring(r)
+end
+local function rel_off(rel, side, st)
+    if rel == MEAS then return st.meas or 0 end
+    if rel == MEAS_INV then return -(st.meas or 0) end
+    if rel == MAXD then return st.m.maxd * side end
+    if rel == MAXDN then return -st.m.maxd * side end
+    if rel == PRED then return st.pred_off or st.meas or 0 end
+    if rel == MID then return st.m.mid * side end
+    return rel * side
+end
+local function cand_norm(rel, st) return rel_off(rel, st.side, st) * st.side end
+
+local function mark_tried(st, bk, rel)
+    if rel == nil then return end
+    bk.tried[rel] = true
+    bk.tn[#bk.tn + 1] = cand_norm(rel, st)
+end
+local function clear_tried(bk)
+    for k in pairs(bk.tried) do bk.tried[k] = nil end
+    for i = #bk.tn, 1, -1 do bk.tn[i] = nil end
+end
+local function dup_tried(bk, st, rel)
+    local v = cand_norm(rel, st)
+    for i = 1, #bk.tn do
+        if abs(bk.tn[i] - v) <= 3 then return true end
+    end
+    return false
+end
+local function pick(st, kind, bk, has_meas, retry)
+    local list = ORDER[kind] or ORDER.unknown
+    local best, best_score
+    for i = 1, #list do
+        local rel = list[i]
+        if not bk.tried[rel] and (has_meas or not needs_meas(rel)) and not dup_tried(bk, st, rel) then
+            local sc = score(st, kind, rel)
+            if not best_score or sc > best_score + 1e-9 then best, best_score = rel, sc end
+        end
+    end
+    if best == nil then                               -- все пробовали: новый круг, лучшим по статистике
+        clear_tried(bk)
+        if retry then
+            if has_meas then return MEAS end
+            return 0
+        end
+        return pick(st, kind, bk, has_meas, true)
+    end
+    return best
+end
+
+-- ---------- состояния врагов ----------
+local FH = 12
+local states, next_id = {}, 1
+local fires, last_fire = {}, nil
+local enemies, eids, ecount, present = {}, {}, 0, {}
+local keymap = {}
+local next_scan, next_cfg, last_tk = 0, 0, 0
+local next_save = clock() + 60
+local ev_n = { fire = 0, hit = 0, miss = 0, res = 0, spr = 0, spr_res = 0, occ = 0, dth = 0, unm = 0 }
+local ev_last, unm_info = "-", ""
+local dbg_log, diag = {}, { fire = 0, hit = 0, miss = 0 }
+local active = false
+local rerr, perr_txt, perr = "", "", {}
+
+local function get_state(id)
+    local st = states[id]
+    if st then return st end
+    local m = mem[id]
+    if not m then m = { stats = {}, maxd = 58, mid = 58 }; mem[id] = m end
+    st = {
+        n = next_id, id = id, m = m,
+        f = {}, e = {}, ey = nil, fy = nil, d = nil, same = 0,
+        kind = "unknown", fkind = "unknown", ekind = "other",
+        side = 1, meas = nil,
+        buckets = {}, total_miss = 0, spread_streak = 0,
+        mv = nil, rel = 0, off = 0, bkt = "Standing",
+        hits = 0, shots = 0, def_until = 0, pc = {}, next_force = 0,
+        runs = {}, rsign = nil, rt0 = 0, pred_off = nil, per = nil,
+        name = nil, seen = clock(), dead = false,
+    }
+    next_id = next_id + 1
+    states[id] = st
+    return st
+end
+
+local function get_bucket(st, name)
+    local b = st.buckets[name]
+    if not b then
+        b = { cur = nil, cur_kind = nil, tried = {}, tn = {}, step_miss = 0, good = nil, good_rel = nil }
+        st.buckets[name] = b
+    end
+    return b
+end
+
+-- смерть / респавн / новый раунд: чистим только быструю историю. Рабочие углы (bk.good),
+-- статистика, hits/shots, kind и maxd сохраняются -> новая жизнь начинается с известного угла.
+local function reset_transient(st)
+    st.f, st.e, st.runs = {}, {}, {}
+    st.ey, st.fy, st.d, st.same = nil, nil, nil, 0
+    st.fkind, st.ekind = "unknown", "other"
+    st.meas, st.pred_off, st.per, st.rsign, st.rt0 = nil, nil, nil, nil, 0
+    st.def_until, st.next_force, st.pc, st.mv = 0, 0, {}, nil
+    st.total_miss, st.spread_streak = 0, 0
+    for _, bk in pairs(st.buckets) do
+        bk.step_miss, bk.cur, bk.cur_kind = 0, nil, nil
+        clear_tried(bk)
+    end
+end
+local function reset_all_transient()
+    for _, st in pairs(states) do reset_transient(st) end
+end
+
+-- уверенность резольвера (0..1): тип AA, рабочий угол, статистика кандидата, промахи
+local function conf_of(st, bk)
+    local conf
+    if bk and bk.good then
+        conf = 0.9
+        if st.shots >= 4 then conf = conf * (0.4 + 0.6 * (st.hits / st.shots)) end
+    else
+        local kind = st.kind
+        if kind == "static" then conf = st.meas and 0.75 or 0.55
+        elseif kind == "flip" then conf = st.pred_off and 0.6 or 0.35
+        elseif kind == "rand" or kind == "spin" then conf = 0.3
+        else conf = 0.45 end
+        local sc = 0.5
+        if st.rel ~= nil then sc = score(st, kind, st.rel) end
+        conf = conf * (0.6 + 0.8 * sc) * (0.75 ^ st.total_miss)
+    end
+    return clamp(conf, 0, 1)
+end
+
+local function dbg(line)
+    line = tostring(line)
+    dbg_log[#dbg_log + 1] = line
+    if #dbg_log > 5 then table.remove(dbg_log, 1) end
+    print("[resolver] " .. line)
+end
+
+local function pset(en, st, key, val, force)
+    local pc = st.pc
+    if force or pc[key] ~= val then
+        pc[key] = val
+        if not pcall(plist.set, en, key, val) and not perr[key] then
+            perr[key] = true
+            perr_txt = perr_txt .. " [" .. key .. "]"
+        end
+    end
+end
+
+-- ---------- классификация ----------
+-- по измеренному углу desync (feet - eye): static / flip (сторона прыгает) / rand
+local function classify_fr(st)
+    local f, n = st.f, #st.f
+    if n < 4 then return "unknown" end
+    local flips, steps = 0, 0
+    for j = 2, n do
+        local cur, prev = f[j], f[j - 1]
+        if abs(cur) >= 12 and abs(prev) >= 12 then
+            steps = steps + 1
+            if (cur < 0) ~= (prev < 0) then flips = flips + 1 end
+        end
+    end
+    if steps < 3 then return "static" end
+    local ratio = flips / steps
+    if ratio >= 0.5 then return "flip" end
+    if ratio <= 0.15 then return "static" end
+    return "rand"
+end
+
+-- по eye yaw: spin и defensive (разворот >120 за кадр после спокойного периода)
+local function classify_eye(st)
+    local e, n = st.e, #st.e
+    if n < 6 then return "other", false end
+    local sum, sum_abs, prev_abs, last_d = 0, 0, 0, 0
+    for k = 2, n do
+        local d = wrap(e[k] - e[k - 1])
+        local ad = abs(d)
+        if k < n then prev_abs = prev_abs + ad end
+        sum, sum_abs, last_d = sum + d, sum_abs + ad, d
+    end
+    local cnt = n - 1
+    local defensive = abs(last_d) > 120 and (prev_abs / (cnt - 1)) < 25
+    local spin = (abs(sum) > sum_abs * 0.7) and (sum_abs / cnt) > 5
+    return (spin and "spin" or "other"), defensive
+end
+
+-- ---------- предсказание стороны flip/jitter AA ----------
+local function track_runs(st, mx, rt)
+    if abs(mx) < 12 then return end
+    local sg = (mx < 0) and -1 or 1
+    if st.rsign == nil then
+        st.rsign, st.rt0 = sg, rt
+    elseif st.rsign ~= sg then
+        local r = st.runs
+        r[#r + 1] = rt - st.rt0
+        if #r > 6 then table.remove(r, 1) end
+        st.rsign, st.rt0 = sg, rt
+    end
+end
+
+local function update_pred(st, rt)
+    st.pred_off, st.per = nil, nil
+    local r = st.runs
+    local n = #r
+    if n < 3 or not st.meas or st.rsign == nil then return end
+    local lo, hi, sum, cnt = 1e9, 0, 0, 0
+    for i = max(1, n - 3), n do
+        local v = r[i]
+        if v < lo then lo = v end
+        if v > hi then hi = v end
+        sum, cnt = sum + v, cnt + 1
+    end
+    if lo < 0.02 or hi > lo * 1.6 then return end     -- серии нерегулярные -> не предсказываем
+    local per = sum / cnt
+    st.per = per
+    local lead = 0.06
+    if client.latency then
+        local ok, l = pcall(client.latency)
+        if ok and type(l) == "number" then lead = clamp(l, 0.02, 0.25) end
+    end
+    local flips = floor(((rt - st.rt0) + lead) / per)
+    local s = st.rsign
+    if flips % 2 == 1 then s = -s end
+    st.pred_off = s * abs(st.meas)
+end
+
+-- ---------- обработка одного врага ----------
+local function push(arr, v, n)
+    arr[#arr + 1] = v
+    if #arr > n then table.remove(arr, 1) end
+end
+
+local function process(en, id, tk, rt)
+    local st = states[id] or get_state(id)
+    if not st.name then st.name = prop(en, "DisplayName") or prop(en, "Name") or tostring(id) end
+    local anim = entity.get_anim_state(en)
+
+    if anim then
+        local ey, fy, d = anim.eye_angles_y, anim.goal_feet_yaw, anim.desync
+        if type(d) ~= "number" then d = 0 end
+        -- "пакет": eye yaw обновился либо ноги резко прыгнули. Плавное сглаживание в историю не пишем.
+        local packet = false
+        if type(ey) == "number" then
+            if ey ~= st.ey then packet = true
+            elseif type(fy) == "number" and st.fy and abs(wrap(fy - st.fy)) > 20 then packet = true end
+        elseif d ~= st.d then
+            packet = true
+        end
+
+        if packet or fy ~= st.fy or d ~= st.d then
+            local fr = (type(ey) == "number" and type(fy) == "number") and wrap(fy - ey) or nil
+            local mx
+            if c.src == "Desync" then mx = d elseif c.src == "Feet" then mx = fr else mx = fr or d end
+
+            if packet then
+                if type(ey) == "number" and ey ~= st.ey then
+                    push(st.e, ey, 16)
+                    local ek, defensive = classify_eye(st)
+                    st.ekind = ek
+                    if defensive and c.def then st.def_until = tk + 14 end
+                end
+                if type(mx) == "number" then
+                    push(st.f, mx, FH)
+                    st.fkind = classify_fr(st)
+                    track_runs(st, mx, rt)
+                end
+            end
+
+            if type(mx) == "number" then
+                if c.meas_on and abs(mx) >= 12 then
+                    st.meas = clamp(mx, -86, 86)
+                    local a = abs(st.meas)
+                    if a > st.m.maxd then st.m.maxd = a else st.m.maxd = max(25, st.m.maxd * 0.999) end
+                    st.m.mid = st.m.mid * 0.92 + a * 0.08
+                else
+                    st.meas = nil
+                end
+            end
+            if st.meas then st.side = sgn(st.meas)
+            elseif abs(d) > 6 then st.side = sgn(d) end
+
+            st.ey, st.fy, st.d, st.same = ey, fy, d, 0
+            if st.ekind == "spin" then st.kind = "spin"
+            elseif st.fkind ~= "unknown" then st.kind = st.fkind end
+        else
+            st.same = st.same + 1
+            if st.same >= 24 then st.kind = "static" end
+        end
+    end
+
+    -- состояние движения раз в 4 тика
+    if not st.mv or (tk + st.n) % 4 == 0 then
+        local mvs = "All"
+        if c.per_state then
+            mvs = "Standing"
+            if movement and movement.get_state then
+                local ok, r = pcall(movement.get_state, en)
+                if ok and r then mvs = r end
+            end
+        end
+        st.mv = mvs
+    end
+
+    if c.pred and st.kind == "flip" then update_pred(st, rt) else st.pred_off, st.per = nil, nil end
+
+    -- выбор угла: рабочий (который попал) -> иначе лучший по статистике
+    local bk = get_bucket(st, st.mv)
+    local has_meas = st.meas ~= nil
+    local rel
+    if bk.good then
+        rel = bk.good_rel or 0
+    else
+        if bk.cur and needs_meas(bk.cur) and not has_meas then bk.cur = nil end
+        if not bk.cur or (bk.cur_kind ~= st.kind and bk.step_miss == 0 and next(bk.tried) == nil) then
+            bk.cur, bk.cur_kind = pick(st, st.kind, bk, has_meas), st.kind
+        end
+        rel = bk.cur
+    end
+    local off = round(rel_off(rel, st.side, st))
+    st.rel, st.off, st.bkt = rel, off, st.mv
+
+    local force = false
+    if rt >= st.next_force then force = true; st.next_force = rt + 0.5 + (st.n % 5) * 0.1 end
+
+    -- как в примере из доки: Force body yaw + offset каждый тик
+    pset(en, st, "Force body yaw", true, true)
+    pset(en, st, "Override yaw offset", off, true)
+
+    -- политика: против нестабильного AA и при низкой уверенности меняем урон на гарантию попадания
+    local kd = st.kind
+    local hardk  = (kd == "flip" or kd == "rand" or kd == "spin")
+    local proven = bk.good ~= nil and st.hits * 2 >= st.shots          -- рабочий угол + нормальный % попаданий
+    local hard = c.smart_baim and hardk and st.shots >= 3 and st.hits * 3 < st.shots
+    local baim = st.total_miss >= c.baim or tk < st.def_until or hard
+    pset(en, st, "Override prefer body aim", baim and "Force" or "-", force)
+    local sp = st.total_miss >= c.baim + 1
+    if c.sp_hard and not sp and hardk and not proven then sp = true end
+    if c.sp_conf > 0 and not sp and not proven and conf_of(st, bk) * 100 < c.sp_conf then sp = true end
+    pset(en, st, "Override safe point", sp and "Force" or "-", force)
+
+    if c.pitch then
+        pset(en, st, "Force pitch", true, force)
+        pset(en, st, "Force pitch value", 89, force)
+    else
+        pset(en, st, "Force pitch", false, force)
+    end
+end
+
+-- ---------- список врагов + таблица идентификаторов ----------
+local function index_enemy(e, id)
+    keymap[e] = id
+    keymap[id] = id
+    local n = prop(e, "Name")
+    if n ~= nil then keymap[n] = id; keymap[string.lower(tostring(n))] = id end
+    local dn = prop(e, "DisplayName")
+    if dn ~= nil then keymap[string.lower(tostring(dn))] = id end
+    local u = prop(e, "UserId")
+    if u ~= nil then keymap[u] = id end
+    local ch = prop(e, "Character")
+    if ch ~= nil then keymap[ch] = id end
+    local s = get_slot(e)
+    if s ~= nil then keymap[s] = id end
+end
+
+local function scan()
+    local list = entity.get_enemies()
+    if type(list) ~= "table" then return end
+    local n = 0
+    for k in pairs(present) do present[k] = nil end
+    for i = 1, #list do
+        local e = list[i]
+        if entity.is_alive(e) then
+            local id = sid_of(e)
+            n = n + 1
+            enemies[n], eids[n] = e, id
+            present[id] = true
+            index_enemy(e, id)
+        end
+    end
+    for i = n + 1, ecount do enemies[i], eids[i] = nil, nil end
+    ecount = n
+    local now = clock()
+    for id, st in pairs(states) do
+        if present[id] then
+            st.seen, st.dead = now, false
+        else
+            if not st.dead then st.dead = true; reset_transient(st) end
+            if now - (st.seen or now) > 180 then states[id] = nil end   -- ушёл с сервера
+        end
+    end
+end
+
+local function resolver_tick()
+    local rt = clock()
+    if rt >= next_cfg then load_cfg(); next_cfg = rt + 0.25 end
+
+    if not c.en then
+        if active then
+            plist.reset_all()
+            states, fires, last_fire = {}, {}, nil
+            builtin_restore()
+            active = false
+        end
+        return
+    end
+    active = true
+
+    local tk = globals.tickcount()
+    if tk < last_tk then reset_all_transient(); fires, last_fire, next_scan = {}, nil, 0 end
+    last_tk = tk
+
+    if rt >= next_scan then scan(); next_scan = rt + 0.25 end
+    if c.learn and rt >= next_save then next_save = rt + 60; save_stats() end
+
+    for i = 1, ecount do
+        local ok, e = pcall(process, enemies[i], eids[i], tk, rt)
+        if not ok then rerr = string.sub(tostring(e), -90) end
+    end
+end
+
+TICKS[#TICKS + 1] = function()
+    local ok, e = pcall(resolver_tick)
+    if not ok then rerr = string.sub(tostring(e), -90) end
+end
+
+-- ---------- события выстрелов: цель ищем ВСЕМИ способами ----------
+local LOOK = { "slot", "player", "entity", "target", "Name", "name", "UserId", "userid", "index", "id", "Parent", "Character" }
+
+local function lookup(t)
+    if t == nil then return nil end
+    local id = keymap[t]
+    if id ~= nil then return id end
+    local tt = type(t)
+    if tt == "string" then return keymap[string.lower(t)] end
+    if tt == "number" or tt == "boolean" then return nil end
+    for i = 1, #LOOK do                               -- таблица / Instance: типичные поля
+        local v = prop(t, LOOK[i])
+        if v ~= nil and v ~= t then
+            id = keymap[v]
+            if id == nil and type(v) == "string" then id = keymap[string.lower(v)] end
+            if id ~= nil then return id end
+        end
+    end
+    return nil
+end
+
+local function nearest(pt)                            -- враг, ближайший к точке прицеливания
+    local best, bd = nil, 15
+    for i = 1, ecount do
+        local ok, pos = pcall(entity.get_player_position, enemies[i])
+        if ok and pos ~= nil then
+            local ok2, dd = pcall(function() return (pos - pt).Magnitude end)
+            if ok2 and type(dd) == "number" and dd < bd then best, bd = eids[i], dd end
+        end
+    end
+    return best
+end
+
+local function find_id(e)
+    local id = lookup(e.target)
+    if id == nil then scan(); id = lookup(e.target) end          -- возможно, список устарел
+    if id == nil and e.point ~= nil then id = nearest(e.point) end
+    if id == nil then
+        local ok, t = pcall(rage.get_target)
+        if ok and t ~= nil then id = lookup(t) end
+    end
+    if id == nil and ecount == 1 then id = eids[1] end
+    return id
+end
+
+local function ev(a, b, cc)                           -- понимаем и таблицу e, и позиционные аргументы
+    if type(a) == "table" then
+        local t = prop(a, "target")
+        if t ~= nil then return a end
+        if prop(a, "id") ~= nil then return a end
+    end
+    return { target = a, hitbox = b, reason = (type(cc) == "string") and cc or nil }
+end
+
+local function diag_log(kind, e)                      -- первые 3 события каждого вида: что именно приходит
+    if diag[kind] >= 3 then return end
+    diag[kind] = diag[kind] + 1
+    local t = e.target
+    print("[resolver] diag " .. kind .. ": target=" .. type(t) .. ":" .. tostring(t) .. " id=" .. tostring(e.id)
+        .. " reason=" .. tostring(e.reason) .. " hitbox=" .. tostring(e.hitbox))
+end
+
+local function note_unm(kind, e)                     -- что именно не нашлось (виден на HUD)
+    ev_n.unm = ev_n.unm + 1
+    unm_info = kind .. " t=" .. type(e.target) .. ":" .. tostring(e.target) .. " id=" .. tostring(e.id)
+        .. " r=" .. tostring(e.reason)
+end
+
+-- состояние + запись о выстреле для hit / miss
+local function shot_for(e)
+    local f = nil
+    if e.id ~= nil then f = fires[e.id]; fires[e.id] = nil end
+    local st = f and f.st
+    if not st then
+        local id = find_id(e)
+        st = id ~= nil and states[id] or nil
+        if not st then
+            -- цель события не опознана: берём наш последний выстрел (результат приходит сразу за ним)
+            if last_fire and clock() - last_fire.t < 3 then f = last_fire; st = f.st
+            else return nil, nil end
+        end
+    end
+    if not f and last_fire and last_fire.st == st then f = last_fire end
+    if f == last_fire then last_fire = nil end
+    if not f then f = { st = st, rel = st.rel, off = st.off, kind = st.kind, bkt = st.bkt, t = clock() } end
+    return st, f
+end
+
+client.set_event_callback("aim_fire", function(a, b, cc)
+    local e = ev(a, b, cc)
+    ev_n.fire = ev_n.fire + 1
+    diag_log("fire", e)
+    local id = find_id(e)
+    local st = id ~= nil and states[id] or nil
+    if not st then note_unm("fire", e) return end
+    st.shots = st.shots + 1
+    if st.shots > 24 then st.shots, st.hits = st.shots * 0.5, st.hits * 0.5 end
+    local hc = e.hitchance
+    if type(hc) == "number" then
+        if hc <= 0 then hc = nil elseif hc <= 1 then hc = hc * 100 end
+    end
+    local now = clock()
+    local f = { st = st, rel = st.rel, off = st.off, kind = st.kind, bkt = st.bkt, hc = hc, t = now }
+    if e.id ~= nil then
+        fires[e.id] = f
+        for k, old in pairs(fires) do                 -- чистим потерянные выстрелы
+            if now - old.t > 6 then fires[k] = nil end
+        end
+    end
+    last_fire = f
+    if c.dbg then
+        dbg("fire kind=" .. st.kind .. " rel=" .. rel_name(st.rel) .. " off=" .. st.off
+            .. " meas=" .. tostring(st.meas and round(st.meas)) .. " hc=" .. tostring(hc and round(hc)))
+    end
+end)
+
+client.set_event_callback("aim_hit", function(a, b, cc)
+    local e = ev(a, b, cc)
+    ev_n.hit = ev_n.hit + 1
+    diag_log("hit", e)
+    local st, f = shot_for(e)
+    if not st then note_unm("hit", e) return end
+    local bk = get_bucket(st, f.bkt or st.bkt)
+    st.hits = st.hits + 1
+    st.spread_streak = 0
+    credit(st, f.kind, f.rel, true)
+    bk.good, bk.good_rel, bk.step_miss = f.off, f.rel, 0
+    clear_tried(bk)
+    if c.reset_hit then st.total_miss = 0 end
+    if c.dbg then dbg("HIT kind=" .. f.kind .. " rel=" .. rel_name(f.rel) .. " off=" .. f.off) end
+end)
+
+client.set_event_callback("aim_miss", function(a, b, cc)
+    local e = ev(a, b, cc)
+    ev_n.miss = ev_n.miss + 1
+    diag_log("miss", e)
+    ev_last = tostring(e.reason)
+    local st, f = shot_for(e)
+    if not st then note_unm("miss", e) return end
+
+    -- reason по доке: "resolver" | "spread" | "occlusion" | "death". Нет причины - считаем resolver.
+    local r = e.reason and string.lower(tostring(e.reason)) or ""
+    if string.find(r, "occlu", 1, true) then ev_n.occ = ev_n.occ + 1 return end
+    if string.find(r, "death", 1, true) or string.find(r, "dead", 1, true) then ev_n.dth = ev_n.dth + 1 return end
+    if string.find(r, "spread", 1, true) then
+        ev_n.spr = ev_n.spr + 1
+        -- движок часто пишет "spread" на промахи резольвера: высокий HC выстрела или 2-й подряд -> наказываем
+        local count = false
+        if c.spr_res then
+            local bk0 = get_bucket(st, f.bkt or st.bkt)
+            if bk0.good then count = st.spread_streak >= 1
+            elseif f.hc == nil or f.hc >= c.spr_hc or st.spread_streak >= 1 then count = true end
+        end
+        if not count then
+            st.spread_streak = st.spread_streak + 1
+            if c.dbg then dbg("miss(spread, ignored)") end
+            return
+        end
+        ev_n.spr_res = ev_n.spr_res + 1
+    end
+    ev_n.res = ev_n.res + 1
+    st.spread_streak = 0
+
+    local bk = get_bucket(st, f.bkt or st.bkt)
+    credit(st, f.kind, f.rel, false)
+    st.total_miss = st.total_miss + 1
+    bk.step_miss = bk.step_miss + 1
+    if c.dbg then
+        dbg("MISS(" .. r .. ") kind=" .. f.kind .. " rel=" .. rel_name(f.rel) .. " off=" .. f.off .. " total=" .. st.total_miss)
+    end
+
+    if bk.good then                                   -- у рабочего угла запас на 1 промах
+        if bk.step_miss >= c.step + 1 then
+            mark_tried(st, bk, bk.good_rel)
+            bk.good, bk.good_rel, bk.step_miss, bk.cur = nil, nil, 0, nil
+        end
+    elseif bk.step_miss >= c.step then
+        mark_tried(st, bk, f.rel or bk.cur)
+        bk.step_miss, bk.cur = 0, nil
+    end
+end)
+
+client.set_event_callback("round_start", function()
+    reset_all_transient()
+    fires, last_fire, next_scan = {}, nil, 0
+end)
+
+secm:new_button("Reset Learned Angles", function()
+    gstats = {}
+    for _, m in pairs(mem) do m.stats = {} end
+    for _, st in pairs(states) do st.buckets, st.total_miss, st.spread_streak = {}, 0, 0 end
+    save_stats()
+end)
+
+-- ---------- HUD ----------
+HUDS[#HUDS + 1] = { name = "Resolver", fn = function()
+    if not c.en then return nil end
+    local rows = {}
+    local ok, t = pcall(rage.get_target)
+    local st
+    if ok and t ~= nil then
+        local id = lookup(t)
+        st = id ~= nil and states[id] or nil
+    end
+    if st then
+        local bk = get_bucket(st, st.bkt)
+        local cf = conf_of(st, bk)
+        local ccol = (cf >= 0.66 and COL.ok) or (cf >= 0.4 and COL.warn) or COL.bad
+        rows[1] = { "Target", tostring(st.name) .. "  [" .. st.kind .. "]", COL.txt }
+        rows[2] = { "Angle", (st.off >= 0 and "+" or "") .. round(st.off) .. "°  " .. rel_name(st.rel)
+            .. (st.per and ("  " .. floor(st.per * 1000) .. "ms") or ""), COL.txt }
+        rows[3] = { "Conf", round(cf * 100) .. "%", ccol, cf }
+        local sttxt, stcol = "SEARCH", COL.dim
+        if globals.tickcount() < st.def_until then sttxt, stcol = "DEFENSIVE", COL.warn
+        elseif bk.good then sttxt, stcol = "LOCKED", COL.ok end
+        local hr = st.shots > 0 and floor(st.hits / st.shots * 100) or 0
+        rows[4] = { "State", sttxt .. "  " .. floor(st.hits) .. "/" .. floor(st.shots) .. " " .. hr .. "%  m" .. st.total_miss, stcol }
+    else
+        rows[1] = { "Tracked", ecount .. " enemies", COL.txt }
+        rows[2] = { "Target", (ok and t ~= nil) and "unmatched" or "none", COL.dim }
+    end
+    if perr_txt ~= "" then rows[#rows + 1] = { "PLIST", perr_txt, COL.bad } end
+    if rerr ~= "" then rows[#rows + 1] = { "ERR", rerr, COL.bad } end
+    return { title = "RESOLVER", rows = rows }
+end }
+
+HUDS[#HUDS + 1] = { name = "Shots", fn = function()
+    if not c.en then return nil end
+    local pct = ev_n.fire > 0 and floor(ev_n.hit / ev_n.fire * 100) or 0
+    local rows = {
+        { "Fire/Hit", ev_n.fire .. " / " .. ev_n.hit .. "  (" .. pct .. "%)",
+          ev_n.fire == 0 and COL.dim or (pct >= 60 and COL.ok or (pct >= 35 and COL.warn or COL.bad)) },
+        { "Miss", "res " .. ev_n.res .. " spr " .. ev_n.spr .. "(" .. ev_n.spr_res .. ") occ " .. ev_n.occ
+            .. " dth " .. ev_n.dth, COL.txt },
+    }
+    if ev_n.unm > 0 then
+        rows[#rows + 1] = { "Unmatched", tostring(ev_n.unm), COL.warn }
+        rows[#rows + 1] = { "", unm_info, COL.dim }
+    end
+    if c.dbg then
+        rows[#rows + 1] = { "why", ev_last .. "  builtin " .. (builtin_prev ~= nil and "off" or "on"), COL.dim }
+        for i = 1, #dbg_log do rows[#rows + 1] = { "", dbg_log[i], COL.dim } end
+    end
+    return { title = "SHOTS", rows = rows }
+end }
+
+-- интерфейс для HC: уверенность по цели (key = slot / объект / таблица цели)
+SHARED.res_info = function(key)
+    local id = lookup(key)
+    local st = id ~= nil and states[id] or nil
+    if not st then return nil end
+    local bk = get_bucket(st, st.bkt)
+    return { conf = conf_of(st, bk), kind = st.kind, miss = st.total_miss, locked = (bk.good ~= nil) }
+end
+
+STOPS[#STOPS + 1] = function()
+    plist.reset_all()
+    builtin_restore()
+    if c.learn then save_stats() end
+end
+end -- PART 2
+
+
+-- ============================================================
+--  PART 3: SMART HITCHANCE (SSG 08 / Deagle) + head multipoint от уверенности резольвера
+-- ============================================================
+do
+local tab  = menu.new_tab("Smart Hitchance", ICON)
+local sec  = tab:new_section("Hitchance", "Left")
+local secS = tab:new_section("SSG 08", "Right")
+local secD = tab:new_section("Deagle", "Right")
+
+local U = {}
+U.on     = T(sec, "Smart Hitchance (vs spread)", true)
+U.good   = S(sec, "HC: stand + scoped", 0, 100, 62, 0, "%")
+U.bad    = S(sec, "HC: moving / unscoped / air", 0, 100, 80, 0, "%")
+U.speed  = S(sec, "Moving above speed", 1, 30, 8, 0, " st/s")
+U.duck   = S(sec, "Crouch HC bonus", 0, 30, 8, 0, "%")
+U.hoff   = S(sec, "Head HC offset", -20, 20, 5, 0, "%")
+U.lethal = S(sec, "Lethal shot HC reduction", 0, 40, 20, 0, "%")
+U.dynmp  = T(sec, "Head MP only if resolver confident", true)
+U.mp_hc  = S(sec, "Head MP needs confidence >=", 0, 100, 30, 0, "%")
+
+local function mkprof(s, tag, good, bad)
+    local u = {}
+    u.on   = T(s, tag .. " profile", true)
+    u.good = S(s, tag .. " HC: stand + scoped", 0, 100, good, 0, "%")
+    u.bad  = S(s, tag .. " HC: moving / unscoped / air", 0, 100, bad, 0, "%")
+    u.mph  = T(s, tag .. " Multipoint head", true)
+    u.mpb  = T(s, tag .. " Multipoint body", true)
+    u.mdh  = S(s, tag .. " Min dmg head (0 = menu)", 0, 150, 0, 0, "")
+    u.mdb  = S(s, tag .. " Min dmg body (0 = menu)", 0, 150, 0, 0, "")
+    return u
+end
+local US = mkprof(secS, "SSG", 65, 82)
+local UD = mkprof(secD, "Deagle", 58, 76)
+
+local c = { on = true, good = 70, bad = 88, speed = 8, duck = 8, hoff = 5, lethal = 15,
+            dynmp = true, mp_hc = 45, ssg = {}, dg = {} }
+local HITBOXES = { "head", "chest", "pelvis", "arms", "legs" }
+local H = { cur = nil, wid = nil, pkey = nil, txt = "menu", next_t = 0, force_t = 0, box_t = 0, cfg_t = 0,
+            err = "", mph = nil, mpb = nil, head_off = false, info = nil, info_t = 0, lethal = false, mkey = nil }
+
+local function load_prof(u, d)
+    d.on   = u.on:get() and true or false
+    d.good = u.good:get()
+    d.bad  = u.bad:get()
+    d.mph  = u.mph:get() and true or false
+    d.mpb  = u.mpb:get() and true or false
+    d.mdh  = u.mdh:get()
+    d.mdb  = u.mdb:get()
+end
+local function load_cfg()
+    c.on     = U.on:get() and true or false
+    c.good   = U.good:get()
+    c.bad    = U.bad:get()
+    c.speed  = U.speed:get()
+    c.duck   = U.duck:get()
+    c.hoff   = U.hoff:get()
+    c.lethal = U.lethal:get()
+    c.dynmp  = U.dynmp:get() and true or false
+    c.mp_hc  = U.mp_hc:get()
+    load_prof(US, c.ssg)
+    load_prof(UD, c.dg)
+end
+
+local function hb_off(hb)
+    if hb == "head" then return c.hoff end
+    return 0
+end
+
+local function apply(v, boxes)
+    pcall(rage.override_hitchance, v)
+    if boxes and rage.override_hitbox_hitchance then
+        for i = 1, #HITBOXES do
+            local hb = HITBOXES[i]
+            pcall(rage.override_hitbox_hitchance, hb, clamp(v + hb_off(hb), 0, 100))
+        end
+    end
+end
+
+local function apply_prof(p, v)
+    pcall(rage.override_hitchance, v)
+    local list = { "head", "chest", "pelvis" }
+    if rage.override_hitboxes then pcall(rage.override_hitboxes, list) end
+    if rage.override_hitbox_priority then pcall(rage.override_hitbox_priority, { "head", "chest", "pelvis" }) end
+    local mph, mpb = H.mph, H.mpb
+    if mph == nil then mph = p.mph end
+    if mpb == nil then mpb = p.mpb end
+    if rage.set_hitbox_config then
+        for i = 1, #list do
+            local hb = list[i]
+            local conf = { hitchance = clamp(v + hb_off(hb), 0, 100) }
+            if hb == "head" then
+                conf.multipoint = mph
+                if p.mdh > 0 then conf.min_damage = p.mdh end
+            else
+                conf.multipoint = mpb
+                if p.mdb > 0 then conf.min_damage = p.mdb end
+            end
+            pcall(rage.set_hitbox_config, hb, conf)
+        end
+    elseif rage.override_hitbox_hitchance then
+        for i = 1, #list do
+            pcall(rage.override_hitbox_hitchance, list[i], clamp(v + hb_off(list[i]), 0, 100))
+        end
+    end
+end
+
+local function pick_prof(w)
+    local s = string.lower(tostring(w.name or "") .. " " .. tostring(w.id or ""))
+    if string.find(s, "ssg", 1, true) or string.find(s, "scout", 1, true) then
+        if c.ssg.on then return c.ssg, "SSG" end
+    elseif string.find(s, "deagle", 1, true) or string.find(s, "desert", 1, true) then
+        if c.dg.on then return c.dg, "DEAGLE" end
+    end
+    return nil, nil
+end
+
+local function compute()
+    local w = weapon.get_active()
+    if type(w) ~= "table" then return nil end
+    local prof, pname = pick_prof(w)
+    local t = 0
+    local wt = string.lower(tostring(w.type or ""))
+    if (string.find(wt, "sniper", 1, true) or pname == "SSG") and not weapon.is_scoped() then t = 1 end
+    if movement.get_speed() > c.speed then t = 1 end
+    if not movement.is_grounded() then t = 1 end
+    local good, bad = c.good, c.bad
+    if prof then good, bad = prof.good, prof.bad end
+    local v = round(good + (bad - good) * t)
+    if t < 1 and c.duck > 0 then
+        local okd, dk = pcall(movement.is_ducking)
+        if okd and dk then v = v - c.duck end
+    end
+    -- добивающий выстрел: ожидаемый урон >= HP цели -> HC можно ниже
+    H.lethal = false
+    if c.lethal > 0 then
+        local okt, tg = pcall(rage.get_target)
+        if okt and type(tg) == "table" and type(tg.damage) == "number" then
+            local pl = tg.player or tg.entity or tg.target
+            if pl ~= nil then
+                local okh, hp = pcall(entity.get_player_health, pl)
+                if okh and type(hp) == "number" and hp > 0 and tg.damage >= hp then
+                    v = v - c.lethal
+                    H.lethal = true
+                end
+            end
+        end
+    end
+    return clamp(v, 0, 100), t, w, prof, pname
+end
+
+-- multipoint головы выключаем, пока резольвер не уверен в цели (гистерезис 5%)
+local function calc_mp(prof, rt)
+    local mph, mpb = prof.mph, prof.mpb
+    if c.dynmp then
+        local conf = 0.7
+        local okt, tg = pcall(rage.get_target)
+        if okt and type(tg) == "table" and SHARED.res_info then
+            local oki, info = pcall(SHARED.res_info, tg)
+            if oki and type(info) == "table" then H.info, H.info_t = info, rt end
+        end
+        if H.info and (rt - H.info_t) < 1.5 then conf = H.info.conf end
+        local thr = c.mp_hc / 100
+        if H.head_off then
+            if conf >= thr + 0.05 then H.head_off = false end
+        elseif conf < thr then
+            H.head_off = true
+        end
+        if H.head_off then mph = false end
+    else
+        H.head_off = false
+    end
+    return mph, mpb
+end
+
+local function hc_tick()
+    local rt = clock()
+    if rt >= H.cfg_t then load_cfg(); H.cfg_t = rt + 0.25 end
+    if rt < H.next_t then return end
+    H.next_t = rt + 0.05
+
+    if not c.on then
+        if H.cur ~= nil then pcall(rage.reset); H.cur, H.wid, H.pkey, H.txt, H.v = nil, nil, nil, "menu", nil end
+        return
+    end
+    if not ME.alive then return end
+
+    local ok, v, t, w, prof, pname = pcall(compute)
+    if not ok then H.txt = "err"; H.err = string.sub(tostring(v), -80) return end
+    if v == nil then H.txt, H.v = "no weapon", nil return end
+    H.err = ""
+
+    local pkey = pname or "-"
+    if pkey ~= H.pkey then
+        if H.pkey ~= nil and H.pkey ~= "-" then pcall(rage.reset) end
+        H.pkey, H.cur, H.wid, H.mkey, H.head_off = pkey, nil, nil, nil, false
+    end
+
+    local mchanged = false
+    if prof then
+        local mph, mpb = calc_mp(prof, rt)
+        local mkey = tostring(mph) .. tostring(mpb)
+        if mkey ~= H.mkey then mchanged = true; H.mkey = mkey; H.mph, H.mpb = mph, mpb end
+    end
+
+    local wid = w.id or w.name
+    local changed = (v ~= H.cur) or (wid ~= H.wid) or mchanged
+    if changed or rt >= H.force_t then
+        H.cur, H.wid, H.force_t = v, wid, rt + 1
+        local boxes = changed or rt >= H.box_t
+        if boxes then H.box_t = rt + 3 end
+        if prof then
+            if boxes then apply_prof(prof, v) else pcall(rage.override_hitchance, v) end
+        else
+            apply(v, boxes)
+        end
+    end
+    H.v, H.tq, H.pname = v, t, pname
+    H.txt = "want " .. v .. (t >= 1 and " (bad)" or " (good)")
+        .. (H.lethal and " | LETHAL" or "")
+        .. (pname and (" | " .. pname .. " MP " .. (H.mph and "H" or "-") .. (H.mpb and "B" or "-")) or "")
+end
+
+TICKS[#TICKS + 1] = function()
+    local ok, e = pcall(hc_tick)
+    if not ok then H.err = string.sub(tostring(e), -80) end
+end
+
+HUDS[#HUDS + 1] = { name = "Hitchance", fn = function()
+    if not c.on then return nil end
+    local rows = {}
+    if H.v then
+        local bad = (H.tq or 0) >= 1
+        rows[1] = { "Hitchance", H.v .. "%  " .. (bad and "moving/unscoped" or "stable"), bad and COL.warn or COL.ok }
+        rows[2] = { "Profile", (H.pname or "default") .. "  MP "
+            .. (H.pname and ((H.mph and "H" or "-") .. (H.mpb and "B" or "-")) or "menu")
+            .. (H.lethal and "  LETHAL" or ""), H.lethal and COL.ok or COL.txt }
+    else
+        rows[1] = { "Hitchance", H.txt, COL.dim }
+    end
+    if H.err ~= "" then rows[#rows + 1] = { "ERR", H.err, COL.bad } end
+    return { title = "HITCHANCE", rows = rows }
+end }
+
+STOPS[#STOPS + 1] = function() if H.cur ~= nil then pcall(rage.reset) end end
+end -- PART 3
+
+
+-- ============================================================
+--  PART 4: HUD-панель (Drawing) + единый on_tick
+--  Объекты в пуле, перерисовка только при изменении данных (опрос 6-7 Гц), без аллокаций в paint.
+-- ============================================================
+do
+local tab = menu.new_tab("HVH HUD", ICON)
+local sec = tab:new_section("HUD", "Left")
+
+local U = {}
+U.master = sec:new_toggle("Show HUD", true)
+local show = {}
+for i = 1, #HUDS do show[i] = sec:new_toggle("Show: " .. HUDS[i].name, true) end
+U.x     = sec:new_slider("HUD X", 0, 1920, 20, 0, "px")
+U.y     = sec:new_slider("HUD Y", 0, 1080, 300, 0, "px")
+U.size  = sec:new_slider("HUD Size", 10, 20, 12, 0, "px")
+U.alpha = sec:new_slider("HUD Opacity", 30, 100, 88, 0, "%")
+sec:new_button("Apply Recommended Settings", function()
+    for i = 1, #PRESET do
+        local p = PRESET[i]
+        pcall(function() p.el:set(p.def, true) end)
+    end
+end)
+
+local FONT = (Drawing.Fonts and Drawing.Fonts.Plex) or 2
+local C_BG, C_LINE, C_TRACK, C_BORDER = color(13, 15, 23), color(38, 43, 62), color(34, 38, 54), color(52, 58, 84)
+local C_G1, C_G2 = color(66, 88, 232), color(132, 72, 220)
+
+-- постоянные объекты: фон, шапка, индикатор статуса
+local bg, hdr, dot = Drawing.new("Square"), Drawing.new("Square"), Drawing.new("Circle")
+pcall(function()
+    bg.Filled, hdr.Filled, dot.Filled = true, true, true
+    bg.ZIndex, hdr.ZIndex, dot.ZIndex = 10, 11, 14
+    dot.Radius = 4
+end)
+bg.Visible, hdr.Visible, dot.Visible = false, false, false
+
+-- пул текстов и прямоугольников (бары, разделители, метки секций)
+local TXT, SQR = {}, {}
+local nt, nq = 0, 0
+
+local function T()
+    nt = nt + 1
+    local o = TXT[nt]
+    if not o then
+        o = Drawing.new("Text")
+        pcall(function() o.Font = FONT; o.Outline = false; o.ZIndex = 13 end)
+        TXT[nt] = o
+    end
+    o.Visible = true
+    return o
+end
+
+local function Q()
+    nq = nq + 1
+    local o = SQR[nq]
+    if not o then
+        o = Drawing.new("Square")
+        pcall(function() o.Filled = true; o.ZIndex = 12 end)
+        SQR[nq] = o
+    end
+    o.Visible = true
+    return o
+end
+
+local function settx(o, str, x, y, size, col)
+    o.Text, o.Size, o.Position, o.Color = str, size, vector(x, y), col
+end
+
+local function setsq(o, x, y, w, h, col, a, rnd)
+    o.Position, o.Size, o.Color = vector(x, y), vector(w, h), col
+    o.Transparency, o.Rounding = a, rnd
+end
+
+local function tw(str, size)                          -- ширина текста (фолбэк - эвристика)
+    local ok, v = pcall(render.measure_text, str, size, FONT)
+    if ok and v ~= nil then
+        local w = v.X
+        if type(w) == "number" then return w end
+    end
+    return #str * size * 0.56
+end
+
+local function layout(secs, x, y, sz, alpha, alive)
+    nt, nq = 0, 0
+    local pad  = round(sz * 0.8)
+    local rowh = sz + 5
+    local labw = round(sz * 5.8)
+    local W    = round(sz * 26)
+    local hh   = sz + 16
+    local lx0  = x + pad + 9
+    local vw   = W - pad * 2 - 9 - labw
+    local maxc = max(8, floor(vw / (sz * 0.56)))
+    local barw = floor(vw * 0.55)
+
+    -- шапка: градиент + название + статус
+    setsq(hdr, x, y, W, hh, C_G1, alpha, 8)
+    hdr.Visible = true
+    pcall(function() hdr.Gradient = { Color1 = C_G1, Color2 = C_G2, Angle = 0 } end)
+    local ty = y + floor((hh - sz) / 2) - 1
+    local title = T(); settx(title, "HVH LITE", x + pad, ty, sz + 1, COL.txt)
+    local ver = T();   settx(ver, "v9.1", x + pad + tw("HVH LITE", sz + 1) + 6, ty + 1, sz - 1, color(230, 234, 255))
+    local stxt = alive and "ALIVE" or "DEAD"
+    local st = T();    settx(st, stxt, x + W - pad - 13 - tw(stxt, sz - 1), ty + 1, sz - 1, COL.txt)
+    dot.Position, dot.Color, dot.Visible = vector(x + W - pad - 4, y + floor(hh / 2)), alive and COL.ok or COL.bad, true
+
+    -- секции
+    local cy = y + hh + 8
+    for si = 1, #secs do
+        local s = secs[si]
+        if si > 1 then
+            setsq(Q(), x + pad, cy - 3, W - pad * 2, 1, C_LINE, 1, 0)
+            cy = cy + 3
+        end
+        setsq(Q(), x + pad, cy + 2, 3, sz - 3, COL.acc, 1, 1)
+        settx(T(), s.title, x + pad + 9, cy, sz - 1, COL.dim)
+        cy = cy + rowh
+
+        local rows = s.rows
+        for ri = 1, #rows do
+            local r = rows[ri]
+            local lbl, val, col, bar = r[1], tostring(r[2] or ""), r[3] or COL.txt, r[4]
+            local vx = lx0 + labw
+            if lbl and lbl ~= "" then settx(T(), lbl, lx0, cy, sz, COL.dim) end
+            if bar then
+                local by = cy + floor(sz / 2) - 1
+                setsq(Q(), vx, by, barw, 5, C_TRACK, 1, 2)
+                setsq(Q(), vx, by, max(3, floor(barw * clamp(bar, 0, 1))), 5, col, 1, 2)
+                settx(T(), val, vx + barw + 6, cy, sz, col)
+                cy = cy + rowh
+            else
+                local rest = val
+                repeat                                  -- длинное значение переносим по пробелам
+                    local cut = maxc
+                    if #rest > maxc then
+                        for k = maxc, floor(maxc * 0.5), -1 do
+                            if string.byte(rest, k) == 32 then cut = k; break end
+                        end
+                    else
+                        cut = #rest
+                    end
+                    settx(T(), string.sub(rest, 1, cut), vx, cy, sz, col)
+                    cy = cy + rowh
+                    rest = string.gsub(string.sub(rest, cut + 1), "^%s+", "")
+                until rest == ""
+            end
+        end
+        cy = cy + 3
+    end
+
+    -- фон под всё
+    setsq(bg, x, y, W, cy - y + 2, C_BG, alpha, 8)
+    bg.Visible = true
+    pcall(function() bg.BorderColor = C_BORDER end)
+
+    for i = nt + 1, #TXT do TXT[i].Visible = false end
+    for i = nq + 1, #SQR do SQR[i].Visible = false end
+end
+
+local h_next, h_sig, h_vis, h_err = 0, "", false, false
+local function hide_all()
+    if not h_vis then return end
+    h_vis, h_sig = false, ""
+    bg.Visible, hdr.Visible, dot.Visible = false, false, false
+    for i = 1, #TXT do TXT[i].Visible = false end
+    for i = 1, #SQR do SQR[i].Visible = false end
+end
+
+client.set_event_callback("paint", function()
+    if not U.master:get() then hide_all(); return end
+    local rt = clock()
+    if rt < h_next then return end
+    h_next = rt + 0.15
+
+    local secs, n = {}, 0
+    for i = 1, #HUDS do
+        if show[i]:get() then
+            local ok, s = pcall(HUDS[i].fn)
+            if ok and s then n = n + 1; secs[n] = s end
+        end
+    end
+    if n == 0 then hide_all(); return end
+
+    local x, y, sz, al = floor(U.x:get()), floor(U.y:get()), floor(U.size:get()), U.alpha:get() / 100
+    local alive = ME.alive and true or false
+
+    local sg = { x, y, sz, al, tostring(alive) }
+    local m = #sg
+    for i = 1, n do
+        local s = secs[i]
+        m = m + 1; sg[m] = s.title
+        for j = 1, #s.rows do
+            local r = s.rows[j]
+            m = m + 1
+            sg[m] = tostring(r[1]) .. "\2" .. tostring(r[2]) .. "\2" .. tostring(r[3]) .. "\2" .. tostring(r[4] and floor(r[4] * 100) or "")
+        end
+    end
+    local sig = table.concat(sg, "\1")
+    if sig == h_sig and h_vis then return end
+    h_sig, h_vis = sig, true
+
+    local ok, e = pcall(layout, secs, x, y, sz, al, alive)
+    if not ok and not h_err then h_err = true; print("[hvh] hud layout error: " .. tostring(e)) end
+end)
+
+-- единственный on_tick: AA -> Resolver -> HC
+events.on_tick(function()
+    update_me(clock())
+    for i = 1, #TICKS do TICKS[i]() end
+end)
+
+client.set_event_callback("shutdown", function()
+    for i = 1, #STOPS do pcall(STOPS[i]) end
+    for i = 1, #TXT do pcall(function() TXT[i]:Destroy() end) end
+    for i = 1, #SQR do pcall(function() SQR[i]:Destroy() end) end
+    pcall(function() bg:Destroy(); hdr:Destroy(); dot:Destroy() end)
+    render.clear()
+end)
+
+print("[hvh] lite v9.1 loaded")
+if notify then notify("HVH Lite v9.1", "AA + Resolver + Smart HC loaded", 2, false) end
+end -- PART 4
