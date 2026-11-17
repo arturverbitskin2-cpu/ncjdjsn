@@ -1,1757 +1,2056 @@
--- ============================================================
---  HVH LITE v9.1  (penablox Lua API)   AA + Resolver + Smart HC + HUD-панель
---
---  Переписано с нуля из v7 (1860 строк -> ~800). Что исправлено:
---   * РЕЗОЛЬВЕР НИЧЕГО НЕ ДЕЛАЛ: события aim_fire/aim_hit/aim_miss приходили, но цель события не
---     находилась среди врагов (на HUD: MISS 0/0 при "why: resolver") -> обучение, замки, статистика
---     не работали. Теперь выстрел привязывается по e.id, а цель ищется по ВСЕМ идентификаторам врага
---     (объект / slot / Name / UserId / Character / поля таблицы), затем по e.point, затем по
---     rage.get_target(). HUD показывает UNMATCHED, если что-то всё же не нашлось.
---   * Встроенный резольвер по умолчанию НЕ отключается (plist работает поверх него, как в доке).
---   * plist Force body yaw / Override yaw offset шлются КАЖДЫЙ тик (как в примере из доки).
---   * Нигде нет varargs (`...`): движок Lua в игре на них падает.
---   * AA: убрана "латч"-логика fake lag, самолечение через get_*, тоггл-мусор; оставлено то, что работает.
---   * Вырезано: ui.reference-проба multipoint scale (всегда n/a), адаптация по inaccuracy,
---     strictness/hoff/boff-слайдеры, автопресет при загрузке, шум в логе.
---  Ошибки "Failed to load sound ... 6534946399" и "MeshContentProvider failed" в консоли Roblox -
---  НЕ от скрипта: это пресет хитсаунда игры и CDN Roblox. Смени хитсаунд в меню игры.
--- ============================================================
+local DB_KEY = "blessed_lua_config_v1"
+local CONFIG_VERSION = 1
 
---  v9 (поверх v8):
---   * Резольвер больше НЕ забывает врага: при смерти/респавне/новом раунде чистится только "быстрая"
---     история (углы, флипы), а выученные рабочие углы (LOCKED), счётчики и статистика остаются.
---     Раньше scan() удалял состояние мёртвого врага -> каждая новая жизнь = брутфорс с нуля.
---   * Safe point / baim включаются СРАЗУ против flip/rand/spin и при низкой уверенности (а не после
---     промахов): меняем урон на гарантию попадания, без задержки выстрела.
---   * Идентификатор врага = UserId (слоты переиспользуются). Ключ базы обновлён (старая статистика v7/v8
---     могла быть отравлена).
---   * Hitchance по умолчанию ниже (меньше "думает перед выстрелом"), головной MP отключается только
---     при очень низкой уверенности, обновление HC 20 Гц.
---   * Новая HUD-панель (Drawing: градиентная шапка, секции, бар уверенности), перерисовка только при
---     изменении данных, пул объектов без аллокаций.
-local ICON  = "rbxassetid://10734975692"
-local clock = globals.realtime or os.clock
-local floor, abs, max, min, random = math.floor, math.abs, math.max, math.min, math.random
-local sin = math.sin
-
-local function wrap(a) return ((a + 180) % 360) - 180 end
-local function sgn(x) if x < 0 then return -1 end return 1 end
-local function round(x) return floor(x + 0.5) end
-local function clamp(x, lo, hi)
-    if x < lo then return lo elseif x > hi then return hi end
-    return x
+local function clamp(value, minimum, maximum)
+if type(value) ~= "number" or value ~= value then
+return minimum
 end
-local function prop(o, name)                       -- безопасное чтение поля (Instance кидает ошибку на чужое поле)
-    local ok, v = pcall(function() return o[name] end)
-    if ok then return v end
-    return nil
+return math.max(minimum, math.min(maximum, value))
 end
 
-local COL = {
-    ok   = color(80, 235, 150),  warn = color(255, 196, 80),  bad = color(255, 92, 104),
-    dim  = color(132, 140, 166), txt  = color(226, 231, 246), acc = color(112, 132, 255),
+local function call_or(fallback, callback, ...)
+local ok, result = pcall(callback, ...)
+if ok then
+return result
+end
+return fallback
+end
+
+local function find_reference(paths)
+for _, path in ipairs(paths) do
+local ok, reference = pcall(ui.reference, path[1], path[2], path[3])
+if ok and reference ~= nil then
+return reference
+end
+end
+return nil
+end
+
+local auto_scope_reference = find_reference({
+{ "RAGE", "Aimbot", "Automatic scope" },
+{ "RAGE", "Aimbot", "Auto scope" },
+{ "RAGE", "Aimbot", "Auto-scope" },
+{ "RAGE", "Other", "Automatic scope" },
+{ "RAGE", "Other", "Auto scope" },
+{ "RAGE", "Weapon settings", "Automatic scope" },
+{ "RAGE", "Weapon", "Automatic scope" }
+})
+
+local auto_duck_reference = find_reference({
+{ "MISC", "Movement", "Auto duck" },
+{ "MISC", "Movement", "Automatic duck" },
+{ "MISC", "Miscellaneous", "Auto duck" }
+})
+
+local original_auto_scope = false
+if auto_scope_reference ~= nil then
+original_auto_scope = call_or(false, ui.get, auto_scope_reference) == true
+end
+
+local original_auto_duck = false
+if auto_duck_reference ~= nil then
+original_auto_duck = call_or(false, ui.get, auto_duck_reference) == true
+end
+
+local original_resolver = {
+enabled = call_or(false, rage.is_resolver_enabled),
+mode = call_or("Adaptive", rage.get_resolver_mode),
+miss_limit = call_or(2, rage.get_resolver_miss_limit),
+baim_after = call_or(2, rage.get_resolver_baim_after_misses)
 }
-local TICKS, STOPS, HUDS, SHARED = {}, {}, {}, {}
-local PRESET = {}
-local function reg(el, def) PRESET[#PRESET + 1] = { el = el, def = def }; return el end
-local function T(sec, name, def) return reg(sec:new_toggle(name, def), def) end
-local function S(sec, name, lo, hi, def, dec, suf) return reg(sec:new_slider(name, lo, hi, def, dec, suf), def) end
-local function C(sec, name, opts, def) return reg(sec:new_combobox(name, opts, def), def) end
 
-local ME = { alive = true, t = 0, me = nil, spawn = false }
-local function update_me(rt)
-    if rt < ME.t then return end
-    ME.t = rt + 0.1
-    local me = entity.get_local_player()
-    ME.me = me
-    if me == nil then ME.alive = true return end
-    local ok, a = pcall(entity.is_alive, me)
-    local alive = (not ok) or (a ~= false)
-    if alive and not ME.alive then ME.spawn = true end
-    ME.alive = alive
+local main_tab = menu.new_tab("blessed.lua", "rbxassetid://10734975692")
+
+local general_section = main_tab:new_section("Runtime", "Left")
+local aa_section = main_tab:new_section("Anti-Aim", "Left")
+local pattern_section = main_tab:new_section("Yaw Patterns", "Left")
+local state_section = main_tab:new_section("State Override", "Left")
+local flick_section = main_tab:new_section("Flick AA", "Left")
+local manual_section = main_tab:new_section("Manual Dirs", "Left")
+local movement_section = main_tab:new_section("Movement Choke", "Right")
+local rage_section = main_tab:new_section("Ragebot", "Right")
+local resolver_section = main_tab:new_section("Resolver", "Right")
+local resolver_advanced_section = main_tab:new_section("Per-Target", "Right")
+local desync_section = main_tab:new_section("Desync & Lag", "Right")
+local body_pattern_section = main_tab:new_section("Body & Lag", "Right")
+
+local master = general_section:new_toggle("Enable blessed.lua", false)
+
+local aa_enabled = aa_section:new_toggle("Anti-aim", false)
+local pitch_mode = aa_section:new_combobox(
+"Pitch",
+{ "Down", "Up", "Zero", "Custom", "Jitter", "Mega" },
+"Down"
+)
+local custom_pitch = aa_section:new_slider("Custom pitch", -89, 89, -89, 0, "°")
+local pitch_jitter_pattern = aa_section:new_combobox(
+"Jitter pattern",
+{ "2-Way", "3-Way", "Random", "Sway" },
+"2-Way"
+)
+local pitch_jitter_a = aa_section:new_slider("Jitter A", -89, 89, -89, 0, "°")
+local pitch_jitter_b = aa_section:new_slider("Jitter B", -89, 89, 89, 0, "°")
+local pitch_jitter_center = aa_section:new_slider("Jitter center", -89, 89, 0, 0, "°")
+local pitch_jitter_speed = aa_section:new_slider("Jitter speed", 1, 16, 1, 0, "t")
+local pitch_mega_sequence = aa_section:new_textbox(
+"Mega sequence",
+"A,B,0,-A,R,-B",
+"A,B,0,-A,A,-B,B,R"
+)
+local pitch_mega_help = aa_section:new_label("A, B, -A, -B, R, deg")
+local yaw_base = aa_section:new_combobox(
+"Yaw base",
+{ "Backward", "Forward", "Left", "Right" },
+"Backward"
+)
+local yaw_offset = aa_section:new_slider("Yaw offset", -180, 180, 0, 0, "°")
+local adaptive_aa = aa_section:new_toggle("Adaptive yaw", false)
+local yaw_modifier = aa_section:new_combobox(
+"Yaw modifier",
+{
+"Disabled",
+"Center",
+"3-Way",
+"5-Way",
+"Spin",
+"Random",
+"Sway",
+"Asymmetric",
+"Sequence",
+"Sine",
+"Triangle"
+},
+"Random"
+)
+local modifier_amount = aa_section:new_slider("Modifier amount", 0, 180, 26, 0, "°")
+
+local yaw_pattern_period = pattern_section:new_slider("Pattern hold", 1, 128, 4, 0, "t")
+local yaw_asymmetric_left = pattern_section:new_slider("Left angle", -180, 180, -32, 0, "°")
+local yaw_asymmetric_right = pattern_section:new_slider("Right angle", -180, 180, 26, 0, "°")
+local yaw_asymmetric_left_hold = pattern_section:new_slider("Left hold", 1, 32, 1, 0, "t")
+local yaw_asymmetric_right_hold = pattern_section:new_slider("Right hold", 1, 32, 1, 0, "t")
+local yaw_sequence = pattern_section:new_textbox(
+"Yaw sequence",
+"angle:hold, angle:hold",
+"-40:2,40:2,0:1"
+)
+local yaw_wave_period = pattern_section:new_slider("Wave period", 2, 512, 64, 0, "t")
+local yaw_spin_speed = pattern_section:new_slider("Spin speed", -720, 720, 120, 0, "°/s")
+local yaw_sequence_help = pattern_section:new_label("Example: -40:2, 40:2")
+
+local manual_direction_enabled = manual_section:new_toggle("Manual dirs", false)
+local manual_left = manual_section:new_keybind("Left", "Hold", "Left")
+local manual_right = manual_section:new_keybind("Right", "Hold", "Right")
+local manual_back = manual_section:new_keybind("Back", "Hold", "Down")
+local manual_forward = manual_section:new_keybind("Forward", "Hold", "Up")
+
+local desync_enabled = desync_section:new_toggle("Body yaw", false)
+local desync_limit = desync_section:new_slider("Desync limit", 0, 86, 85, 0, "°")
+local inverter_key = desync_section:new_keybind("Invert side", "Toggle", "F")
+local auto_invert = desync_section:new_toggle("Auto invert", false)
+local invert_interval = desync_section:new_slider("Invert delay", 1, 32, 1, 0, "t")
+local show_fake = desync_section:new_toggle("Show fake", false)
+local fake_lag_enabled = desync_section:new_toggle("Fake lag", false)
+local fake_lag_limit = desync_section:new_slider("Lag limit", 0, 14, 0, 0, "t")
+local fake_lag_variability = desync_section:new_slider("Variability", 0, 100, 100, 0, "%")
+local unchoke_on_shot = desync_section:new_toggle("Unchoke on shot", false)
+
+local desync_pattern = body_pattern_section:new_combobox(
+"Desync pattern",
+{ "Static", "Alternating", "Random", "Sine", "Sequence", "Explicit" },
+"Static"
+)
+local desync_left_min = body_pattern_section:new_slider("Left min", 0, 86, 20, 0, "°")
+local desync_left_max = body_pattern_section:new_slider("Left max", 0, 86, 85, 0, "°")
+local desync_right_min = body_pattern_section:new_slider("Right min", 0, 86, 20, 0, "°")
+local desync_right_max = body_pattern_section:new_slider("Right max", 0, 86, 85, 0, "°")
+local desync_pattern_period = body_pattern_section:new_slider("Desync period", 1, 256, 8, 0, "t")
+local desync_sequence = body_pattern_section:new_textbox(
+"Desync sequence",
+"limit:hold, limit:hold",
+"30:2,58:1,40:1"
+)
+local desync_real = body_pattern_section:new_slider("Explicit real", -86, 86, 25, 0, "°")
+local desync_fake = body_pattern_section:new_slider("Explicit fake", -86, 86, -25, 0, "°")
+local desync_mirror_explicit = body_pattern_section:new_toggle("Mirror on invert", false)
+local desync_sequence_help = body_pattern_section:new_label("Range: 0..86")
+
+local fake_lag_pattern = body_pattern_section:new_combobox(
+"Fake lag pattern",
+{ "Static", "Alternating", "Random", "Sine", "Sequence" },
+"Static"
+)
+local fake_lag_min = body_pattern_section:new_slider("Choke min", 0, 14, 2, 0, "t")
+local fake_lag_pattern_period = body_pattern_section:new_slider("Lag period", 1, 256, 8, 0, "t")
+local fake_lag_sequence = body_pattern_section:new_textbox(
+"Lag sequence",
+"choke:hold, choke:hold",
+"2:1,6:2,4:1"
+)
+local fake_lag_sequence_help = body_pattern_section:new_label("Range: 0..14")
+
+local state_override_enabled = state_section:new_toggle("State override", false)
+local state_override_mode = state_section:new_combobox(
+"Override mode",
+{ "Spin", "Madness" },
+"Spin"
+)
+local state_on_stand = state_section:new_toggle("Standing", false)
+local state_on_run = state_section:new_toggle("Running", false)
+local state_on_duck = state_section:new_toggle("Crouching", false)
+local state_on_air = state_section:new_toggle("Air / jumping", false)
+local state_pitch = state_section:new_slider("Pitch", -89, 89, 0, 0, "°")
+local state_yaw_base = state_section:new_combobox(
+"Yaw base",
+{ "Backward", "Forward", "Left", "Right" },
+"Backward"
+)
+local state_yaw_offset = state_section:new_slider("Yaw offset", -180, 180, 0, 0, "°")
+local state_spin_direction = state_section:new_combobox(
+"Spin direction",
+{ "Right", "Left" },
+"Right"
+)
+local state_spin_speed = state_section:new_slider("Spin speed", 30, 1440, 720, 0, "°/s")
+local state_madness_period = state_section:new_slider("Madness rate", 1, 32, 2, 0, "t")
+local state_madness_pitch_min = state_section:new_slider("Madness min", -89, 89, -89, 0, "°")
+local state_madness_pitch_max = state_section:new_slider("Madness max", -89, 89, 89, 0, "°")
+local state_madness_yaw_range = state_section:new_slider("Madness range", 0, 180, 180, 0, "°")
+local state_madness_desync = state_section:new_toggle("Random desync", false)
+local state_upper_body_chaos = state_section:new_toggle("Body chaos", false)
+local state_body_chaos_strength = state_section:new_slider("Chaos strength", 0, 89, 65, 0, "°")
+local state_disable_fake_lag = state_section:new_toggle("No fake lag", false)
+
+local flick_enabled = flick_section:new_toggle("Flick AA", false)
+local flick_yaw = flick_section:new_slider("Flick yaw", -180, 180, 180, 0, "°")
+local flick_pitch = flick_section:new_slider("Flick pitch", -89, 89, -89, 0, "°")
+local flick_ticks = flick_section:new_slider("Flick time", 1, 64, 8, 0, "t")
+local flick_rest_ticks = flick_section:new_slider("Rest time", 1, 64, 8, 0, "t")
+local flick_bind_mode = flick_section:new_combobox("Bind mode", { "Hold", "Toggle" }, "Hold")
+local flick_bind = flick_section:new_keybind("Flick key", "Hold", "X")
+
+local rage_enabled = rage_section:new_toggle("Ragebot", false)
+local weapon_profiles = rage_section:new_toggle("Sniper profile", false)
+local min_damage = rage_section:new_slider("Min damage", 1, 130, 30, 0, "")
+local hitchance = rage_section:new_slider("Hitchance", 0, 100, 55, 0, "%")
+local sniper_damage = rage_section:new_slider("Sniper damage", 1, 130, 60, 0, "")
+local sniper_hitchance = rage_section:new_slider("Sniper HC", 0, 100, 65, 0, "%")
+local target_selection = rage_section:new_combobox(
+"Target mode",
+{ "Highest damage", "Near crosshair", "Best hitchance", "Cycle" },
+"Near crosshair"
+)
+local hitbox_preset = rage_section:new_combobox(
+"Hitboxes",
+{ "Head", "Head + chest", "Body", "All" },
+"All"
+)
+local force_baim = rage_section:new_keybind("Body aim", "Hold", "B")
+local force_safe = rage_section:new_keybind("Safe point", "Hold", "V")
+local auto_scope = rage_section:new_toggle("Auto scope", false)
+local auto_scope_unavailable = rage_section:new_label("Auto scope N/A")
+auto_scope:set_visible(auto_scope_reference ~= nil)
+auto_scope_unavailable:set_visible(auto_scope_reference == nil)
+
+local resolver_enabled = resolver_section:new_toggle("Resolver", false)
+local resolver_mode = resolver_section:new_combobox(
+"Mode",
+{ "Brute-force", "Adaptive", "Freestanding" },
+"Adaptive"
+)
+local resolver_miss_limit = resolver_section:new_slider("Miss limit", 1, 5, 2, 0, " misses")
+local resolver_baim_after = resolver_section:new_slider("BAim after", 0, 5, 2, 0, " misses")
+
+local resolver_player_overrides = resolver_advanced_section:new_toggle("Per-target", false)
+local resolver_brute_sequence = resolver_advanced_section:new_textbox(
+"Brute sequence",
+"angle:hold, angle:hold",
+"58,-58,0,86,-86,29,-29"
+)
+local resolver_reset_on_hit = resolver_advanced_section:new_toggle("Reset on hit", false)
+local resolver_lock_on_hit = resolver_advanced_section:new_toggle("Lock yaw", false)
+local resolver_freestand_seed = resolver_advanced_section:new_toggle("Freestand seed", false)
+local resolver_safe_on_baim = resolver_advanced_section:new_toggle("Safe with BAim", false)
+local resolver_sequence_help = resolver_advanced_section:new_label(":N holds N cycles")
+
+local autostop_enabled = movement_section:new_toggle("Movement choke", false)
+local autostop_choke_ticks = movement_section:new_slider("Choke ticks", 1, 14, 3, 0, "t")
+local autostop_min_speed = movement_section:new_slider("Min speed", 1, 200, 10, 0, "")
+local autostop_duck = movement_section:new_toggle("Duck assist", false)
+local autostop_description = movement_section:new_label("Flushes while moving")
+local autostop_duck_unavailable = movement_section:new_label("Auto duck N/A")
+autostop_duck:set_visible(auto_duck_reference ~= nil)
+autostop_duck_unavailable:set_visible(auto_duck_reference == nil)
+
+local function parse_timed_sequence(value, minimum, maximum, allowed_tokens)
+local parsed = { steps = {}, total = 0 }
+local source = tostring(value or ""):gsub(";", ",")
+
+if #source > 1024 then
+return nil
 end
 
-
--- ============================================================
---  PART 1: ANTI-AIM + DESYNC
--- ============================================================
-do
-local real_aa = aa
-local FN, flags = {}, ""
-local function flag(name, mark)
-    local tag = " " .. name .. mark
-    if not string.find(flags, tag, 1, true) then flags = flags .. tag end
-end
-local function acall(name, a, b)                    -- максимум 2 аргумента, без varargs
-    local f = FN[name]
-    if f == nil then
-        f = real_aa[name]
-        if type(f) ~= "function" then f = false end
-        FN[name] = f
-    end
-    if not f then flag(name, "?") return nil end
-    local ok, r
-    if a == nil then ok, r = pcall(f)
-    elseif b == nil then ok, r = pcall(f, a)
-    else ok, r = pcall(f, a, b) end
-    if not ok then flag(name, "!") return nil end
-    return r
+for raw_token in string.gmatch(source .. ",", "([^,]+),") do
+local compact = raw_token:gsub("%s+", "")
+local value_text, duration_text = compact:match("^(.-):(%d+)$")
+if value_text == nil then
+value_text = compact
+duration_text = "1"
 end
 
-local tab  = menu.new_tab("HVH AA", ICON)
-local sec  = tab:new_section("Angles", "Left")
-local sec2 = tab:new_section("Desync / Fake Lag", "Right")
-local sec3 = tab:new_section("Defensive", "Right")
+local duration = tonumber(duration_text)
+local numeric = tonumber(value_text)
+local step_value = nil
 
-local U = {}
-U.en       = T(sec, "Enable AA", true)
-U.pitch    = C(sec, "Pitch", { "Down", "Up", "Zero", "Disabled" }, "Down")
-U.base     = S(sec, "Yaw Base", -180, 180, 180, 0, "°")
-U.mod      = C(sec, "Yaw Modifier", { "Disabled", "Center", "Spin", "3-Way", "5-Way", "Random", "Sway" }, "Center")
-U.amt      = S(sec, "Modifier Amount", 0, 90, 40, 0, "°")
-U.spd      = S(sec, "Sway Speed", 1, 10, 2, 0, "x")
-U.mrand    = T(sec, "Randomize Modifier Amount", true)
-U.fake     = T(sec, "Show Fake (ghost)", true)
+if numeric ~= nil and numeric == numeric then
+step_value = clamp(numeric, minimum, maximum)
+elseif allowed_tokens ~= nil then
+local token = string.upper(value_text)
+if allowed_tokens[token] then
+step_value = token
+end
+end
 
-U.limit    = S(sec2, "Desync Max", 0, 86, 86, 0, "°")
-U.rand     = T(sec2, "Randomize Desync", true)
-U.lmin     = S(sec2, "Desync Min", 0, 86, 60, 0, "°")
-U.lbias    = S(sec2, "Desync Bias To Max", 0, 100, 60, 0, "%")
-U.inv_mode = C(sec2, "Inverter Mode", { "Static", "Jitter", "Random", "Anti-Brute" }, "Anti-Brute")
-U.inv_key  = sec2:new_keybind("Invert Side", "Toggle", "F")
-U.inv_per  = S(sec2, "Inverter Period (packets)", 1, 16, 2, 0, "p")
-U.inv_rnd  = S(sec2, "Inverter Randomness", 0, 100, 50, 0, "%")
-U.lag      = T(sec2, "Fake Lag", true)
-U.lag_mode = C(sec2, "Fake Lag Mode", { "Maximum", "Fluctuate", "Random", "Adaptive" }, "Adaptive")
-U.lag_n    = S(sec2, "Fake Lag Limit", 0, 14, 12, 0, "t")
-U.lag_v    = S(sec2, "Fake Lag Variability", 0, 100, 40, 0, "%")
-U.lag_cap  = T(sec2, "Enforce Lag Cap (unchoke)", true)
+if step_value == nil
+or duration == nil
+or duration < 1
+or duration > 256
+or duration ~= math.floor(duration)
+then
+return nil
+end
 
-U.def      = T(sec3, "Defensive Flick", false)
-U.def_ev   = S(sec3, "Flick Every", 16, 128, 48, 0, "t")
+table.insert(parsed.steps, {
+value = step_value,
+duration = duration
+})
+parsed.total = parsed.total + duration
 
-local A = {
-    on = false, was_dead = false, cfg_t = 0, force_t = 0, sig = nil, lsig = nil, ang_dirty = true,
-    cyc = 0, since = 0, ch = 0, ch_prev = 0, ch_last = nil, stuck = 0, own = 0, force_cycle = true,
-    inv = false, lim = 58, brute = false, rnd = false, next_flip = 0, next_lim = 0,
-    last_hp = nil, last_flip_t = 0, hit_t = 0, hits_recent = 0, panic_t = 0, hit_flag = false,
-    flick = false, next_flick = 0, sw = false, want = 1, tgt = nil, tgt_bad = 0, capped = false,
-    ap_inv = nil, ap_lim = nil, ap_lag_en = nil, ap_lag_lim = nil, ap_amt = nil,
-    amt_eff = nil, next_amt = 0, tw = nil, tw_t = 0, err = "",
+if #parsed.steps >= 32 then
+break
+end
+end
+
+if #parsed.steps == 0 or parsed.total <= 0 then
+return nil
+end
+
+return parsed
+end
+
+local function parse_sequence_or_default(value, minimum, maximum, allowed_tokens, fallback)
+return parse_timed_sequence(value, minimum, maximum, allowed_tokens)
+or parse_timed_sequence(fallback, minimum, maximum, allowed_tokens)
+end
+
+local function sample_timed_sequence(sequence, step)
+if sequence == nil or sequence.total == nil or sequence.total <= 0 then
+return 0
+end
+
+local cursor = math.floor(tonumber(step) or 0) % sequence.total
+for _, item in ipairs(sequence.steps) do
+if cursor < item.duration then
+return item.value
+end
+cursor = cursor - item.duration
+end
+
+return sequence.steps[1].value
+end
+
+local MEGA_TOKENS = {
+A = true,
+B = true,
+["-A"] = true,
+["-B"] = true,
+R = true,
+RANDOM = true
 }
-local cfg = { en = false }
-local sway_fn, sway_k, sway_a
 
-local function load_cfg()
-    cfg.en       = U.en:get() and true or false
-    cfg.pitch    = U.pitch:get()
-    cfg.base     = U.base:get()
-    cfg.mod      = U.mod:get()
-    cfg.amt      = U.amt:get()
-    cfg.spd      = U.spd:get()
-    cfg.mrand    = U.mrand:get() and true or false
-    cfg.fake     = U.fake:get() and true or false
-    cfg.limit    = U.limit:get()
-    cfg.rand     = U.rand:get() and true or false
-    cfg.lmin     = U.lmin:get()
-    cfg.lbias    = U.lbias:get()
-    cfg.inv_mode = U.inv_mode:get()
-    cfg.inv_per  = max(1, floor(U.inv_per:get()))
-    cfg.inv_rnd  = U.inv_rnd:get()
-    cfg.lag      = U.lag:get() and true or false
-    cfg.lag_mode = U.lag_mode:get()
-    cfg.lag_n    = floor(U.lag_n:get())
-    cfg.lag_v    = U.lag_v:get()
-    cfg.lag_cap  = U.lag_cap:get() and true or false
-    cfg.def      = U.def:get() and true or false
-    cfg.def_ev   = floor(U.def_ev:get())
-    local sig = tostring(cfg.pitch) .. "|" .. tostring(cfg.base) .. "|" .. tostring(cfg.mod) .. "|"
-        .. tostring(cfg.amt) .. "|" .. tostring(cfg.spd) .. "|" .. tostring(cfg.mrand) .. "|" .. tostring(cfg.fake)
-    if sig ~= A.sig then A.sig = sig; A.ang_dirty = true; A.amt_eff = nil; A.next_amt = 0 end
-    local lsig = tostring(cfg.lag) .. "|" .. tostring(cfg.lag_n) .. "|" .. tostring(cfg.lag_mode)
-    if lsig ~= A.lsig then A.lsig = lsig; A.ap_lag_en, A.ap_lag_lim = nil, nil; A.tgt_bad, A.capped = 0, false end
+local mega_sequence_data = nil
+local yaw_sequence_data = nil
+local desync_sequence_data = nil
+local fake_lag_sequence_data = nil
+local resolver_sequence_data = nil
+
+local function parse_mega_sequence(value)
+mega_sequence_data = parse_sequence_or_default(
+value,
+-89,
+89,
+MEGA_TOKENS,
+"A,B,0,-A,R,-B"
+)
 end
 
-local function roll_period(base, var)
-    local p = base * (1 + (random() * 2 - 1) * var / 100)
-    return max(1, round(p))
+local function parse_yaw_sequence(value)
+yaw_sequence_data = parse_sequence_or_default(value, -180, 180, nil, "-40:2,40:2,0:1")
 end
 
--- ---------- каналы ----------
-local function apply_modifier()
-    local m, amt = cfg.mod, cfg.amt
-    if cfg.mrand and A.amt_eff and m ~= "Spin" then amt = A.amt_eff end
-    A.ap_amt = amt
-    if m == "Sway" then
-        if not sway_fn or sway_k ~= cfg.spd or sway_a ~= amt then
-            sway_k, sway_a = cfg.spd, amt
-            local k, a = cfg.spd * 0.1, amt
-            sway_fn = function(t, by) return sin(t * k) * a end
-        end
-        acall("override_yaw_modifier", sway_fn)
-    elseif m == "Disabled" then
-        acall("override_yaw_modifier", "Disabled")
-    else
-        acall("override_yaw_modifier", m, amt)
-    end
+local function parse_desync_sequence(value)
+desync_sequence_data = parse_sequence_or_default(value, 0, 86, nil, "30:2,58:1,40:1")
 end
 
-local function apply_angles()
-    A.ang_dirty = false
-    if not A.flick then
-        acall("override_pitch", cfg.pitch)
-        acall("override_yaw_offset", 0)
-    end
-    acall("override_yaw", cfg.base, "camera")
-    apply_modifier()
-    acall("override_body_yaw", true)
-    acall("override_show_fake", cfg.fake)
+local function parse_fake_lag_sequence(value)
+fake_lag_sequence_data = parse_sequence_or_default(value, 0, 14, nil, "2:1,6:2,4:1")
 end
 
-local function next_lag()
-    local L, m = cfg.lag_n, cfg.lag_mode
-    if m == "Maximum" then return L end
-    if m == "Fluctuate" then return random(max(1, round(L * (1 - cfg.lag_v / 100))), L) end
-    if m == "Random" then return random(1, L) end
-    -- Adaptive: в воздухе / на бегу длинный лаг, на месте короткий
-    local spd, ground = 0, true
-    local ok1, s1 = pcall(movement.get_speed)
-    if ok1 and type(s1) == "number" then spd = s1 end
-    local ok2, g2 = pcall(movement.is_grounded)
-    if ok2 and g2 == false then ground = false end
-    if not ground then return L end
-    if spd > 6 then return random(max(1, round(L * 0.6)), L) end
-    return random(max(1, round(L / 4)), max(2, round(L / 2)))
+local function parse_resolver_sequence(value)
+resolver_sequence_data = parse_sequence_or_default(value, -180, 180, nil, "58,-58,0,86,-86")
 end
 
-local function end_flick()
-    if A.flick then
-        A.flick = false
-        acall("override_pitch", cfg.pitch)
-        acall("override_yaw_offset", 0)
-    end
+pitch_mega_sequence:set_callback(function(value)
+parse_mega_sequence(value or pitch_mega_sequence:get())
+end)
+yaw_sequence:set_callback(function(value)
+parse_yaw_sequence(value or yaw_sequence:get())
+end)
+desync_sequence:set_callback(function(value)
+parse_desync_sequence(value or desync_sequence:get())
+end)
+fake_lag_sequence:set_callback(function(value)
+parse_fake_lag_sequence(value or fake_lag_sequence:get())
+end)
+resolver_brute_sequence:set_callback(function(value)
+parse_resolver_sequence(value or resolver_brute_sequence:get())
+end)
+
+parse_mega_sequence(pitch_mega_sequence:get())
+parse_yaw_sequence(yaw_sequence:get())
+parse_desync_sequence(desync_sequence:get())
+parse_fake_lag_sequence(fake_lag_sequence:get())
+parse_resolver_sequence(resolver_brute_sequence:get())
+
+local function update_menu_visibility()
+local selected_pitch = pitch_mode:get()
+local jitter_selected = selected_pitch == "Jitter"
+local mega_selected = selected_pitch == "Mega"
+local pitch_jitter_enabled = jitter_selected or mega_selected
+
+custom_pitch:set_visible(selected_pitch == "Custom")
+pitch_jitter_pattern:set_visible(jitter_selected)
+pitch_jitter_a:set_visible(pitch_jitter_enabled)
+pitch_jitter_b:set_visible(pitch_jitter_enabled)
+pitch_jitter_center:set_visible(jitter_selected and pitch_jitter_pattern:get() == "3-Way")
+pitch_jitter_speed:set_visible(pitch_jitter_enabled)
+pitch_mega_sequence:set_visible(mega_selected)
+pitch_mega_help:set_visible(mega_selected)
+yaw_modifier:set_visible(not adaptive_aa:get())
+local selected_yaw_pattern = yaw_modifier:get()
+local custom_yaw_pattern = not adaptive_aa:get()
+modifier_amount:set_visible(
+adaptive_aa:get()
+or selected_yaw_pattern == "Center"
+or selected_yaw_pattern == "3-Way"
+or selected_yaw_pattern == "5-Way"
+or selected_yaw_pattern == "Random"
+or selected_yaw_pattern == "Sway"
+or selected_yaw_pattern == "Sine"
+or selected_yaw_pattern == "Triangle"
+)
+
+local asymmetric_selected = custom_yaw_pattern and selected_yaw_pattern == "Asymmetric"
+local sequence_selected = custom_yaw_pattern and selected_yaw_pattern == "Sequence"
+local wave_selected = custom_yaw_pattern
+and (selected_yaw_pattern == "Sine" or selected_yaw_pattern == "Triangle")
+local spin_selected = custom_yaw_pattern and selected_yaw_pattern == "Spin"
+
+yaw_pattern_period:set_visible(
+custom_yaw_pattern
+and (selected_yaw_pattern == "Center"
+or selected_yaw_pattern == "3-Way"
+or selected_yaw_pattern == "5-Way"
+or selected_yaw_pattern == "Random"
+or asymmetric_selected)
+)
+yaw_asymmetric_left:set_visible(asymmetric_selected)
+yaw_asymmetric_right:set_visible(asymmetric_selected)
+yaw_asymmetric_left_hold:set_visible(asymmetric_selected)
+yaw_asymmetric_right_hold:set_visible(asymmetric_selected)
+yaw_sequence:set_visible(sequence_selected)
+yaw_sequence_help:set_visible(sequence_selected)
+yaw_wave_period:set_visible(wave_selected)
+yaw_spin_speed:set_visible(spin_selected)
+
+local manual_enabled = manual_direction_enabled:get()
+manual_left:set_visible(manual_enabled)
+manual_right:set_visible(manual_enabled)
+manual_back:set_visible(manual_enabled)
+manual_forward:set_visible(manual_enabled)
+
+invert_interval:set_visible(auto_invert:get())
+local body_enabled = desync_enabled:get()
+local selected_desync_pattern = desync_pattern:get()
+desync_pattern:set_visible(body_enabled)
+desync_limit:set_visible(body_enabled and selected_desync_pattern == "Static")
+show_fake:set_visible(desync_enabled:get())
+
+local patterned_desync = body_enabled and selected_desync_pattern ~= "Static"
+local explicit_desync = body_enabled and selected_desync_pattern == "Explicit"
+desync_left_min:set_visible(patterned_desync and not explicit_desync)
+desync_left_max:set_visible(patterned_desync and not explicit_desync)
+desync_right_min:set_visible(patterned_desync and not explicit_desync)
+desync_right_max:set_visible(patterned_desync and not explicit_desync)
+desync_pattern_period:set_visible(
+patterned_desync
+and selected_desync_pattern ~= "Explicit"
+and selected_desync_pattern ~= "Sequence"
+)
+desync_sequence:set_visible(body_enabled and selected_desync_pattern == "Sequence")
+desync_sequence_help:set_visible(body_enabled and selected_desync_pattern == "Sequence")
+desync_real:set_visible(explicit_desync)
+desync_fake:set_visible(explicit_desync)
+desync_mirror_explicit:set_visible(explicit_desync)
+
+fake_lag_limit:set_visible(fake_lag_enabled:get())
+fake_lag_variability:set_visible(fake_lag_enabled:get())
+local lag_enabled = fake_lag_enabled:get()
+local selected_lag_pattern = fake_lag_pattern:get()
+fake_lag_pattern:set_visible(lag_enabled)
+fake_lag_min:set_visible(lag_enabled and selected_lag_pattern ~= "Static")
+fake_lag_pattern_period:set_visible(
+lag_enabled and selected_lag_pattern ~= "Static" and selected_lag_pattern ~= "Sequence"
+)
+fake_lag_sequence:set_visible(lag_enabled and selected_lag_pattern == "Sequence")
+fake_lag_sequence_help:set_visible(lag_enabled and selected_lag_pattern == "Sequence")
+
+local flick_active = flick_enabled:get()
+flick_yaw:set_visible(flick_active)
+flick_pitch:set_visible(flick_active)
+flick_ticks:set_visible(flick_active)
+flick_rest_ticks:set_visible(flick_active)
+flick_bind_mode:set_visible(flick_active)
+flick_bind:set_visible(flick_active)
+
+local resolver_active = resolver_enabled:get() and resolver_player_overrides:get()
+resolver_player_overrides:set_visible(resolver_enabled:get())
+resolver_brute_sequence:set_visible(resolver_active)
+resolver_reset_on_hit:set_visible(resolver_active)
+resolver_lock_on_hit:set_visible(resolver_active)
+resolver_freestand_seed:set_visible(resolver_active)
+resolver_safe_on_baim:set_visible(resolver_active)
+resolver_sequence_help:set_visible(resolver_active)
+
+local movement_choke_enabled = autostop_enabled:get()
+autostop_choke_ticks:set_visible(movement_choke_enabled)
+autostop_min_speed:set_visible(movement_choke_enabled)
+autostop_description:set_visible(movement_choke_enabled)
+autostop_duck:set_visible(movement_choke_enabled and auto_duck_reference ~= nil)
+autostop_duck_unavailable:set_visible(movement_choke_enabled and auto_duck_reference == nil)
+
+sniper_damage:set_visible(weapon_profiles:get())
+sniper_hitchance:set_visible(weapon_profiles:get())
+
+local state_enabled = state_override_enabled:get()
+local madness_selected = state_enabled and state_override_mode:get() == "Madness"
+state_override_mode:set_visible(state_enabled)
+state_on_stand:set_visible(state_enabled)
+state_on_run:set_visible(state_enabled)
+state_on_duck:set_visible(state_enabled)
+state_on_air:set_visible(state_enabled)
+state_pitch:set_visible(state_enabled and not madness_selected)
+state_yaw_base:set_visible(state_enabled and not madness_selected)
+state_yaw_offset:set_visible(state_enabled and not madness_selected)
+state_spin_direction:set_visible(state_enabled and not madness_selected)
+state_spin_speed:set_visible(state_enabled and not madness_selected)
+state_madness_period:set_visible(madness_selected)
+state_madness_pitch_min:set_visible(madness_selected)
+state_madness_pitch_max:set_visible(madness_selected)
+state_madness_yaw_range:set_visible(madness_selected)
+state_madness_desync:set_visible(madness_selected)
+state_upper_body_chaos:set_visible(madness_selected)
+state_body_chaos_strength:set_visible(madness_selected and state_upper_body_chaos:get())
+state_disable_fake_lag:set_visible(state_enabled)
 end
 
--- попали по нам -> меняем сторону (проверка каждый тик)
-local function check_hit(rt)
-    if cfg.inv_mode ~= "Anti-Brute" then A.last_hp = nil return end
-    local me = ME.me
-    if me == nil then return end
-    local hp = entity.get_player_health(me)
-    if type(hp) ~= "number" then return end
-    if A.last_hp and hp < A.last_hp and hp > 0 and (rt - A.last_flip_t) > 0.12 then
-        A.brute = not A.brute
-        A.last_flip_t = rt
-        A.hit_flag = true
-        A.next_lim = 0
-        if rt - A.hit_t < 3 then A.hits_recent = A.hits_recent + 1 else A.hits_recent = 1 end
-        A.hit_t = rt
-        if A.hits_recent >= 2 then A.panic_t = rt + 3 end        -- бьют по паттерну: 3 с рандома
-    end
-    A.last_hp = hp
-end
+pitch_mode:set_callback(update_menu_visibility)
+pitch_jitter_pattern:set_callback(update_menu_visibility)
+adaptive_aa:set_callback(update_menu_visibility)
+yaw_modifier:set_callback(update_menu_visibility)
+manual_direction_enabled:set_callback(update_menu_visibility)
+auto_invert:set_callback(update_menu_visibility)
+desync_enabled:set_callback(update_menu_visibility)
+desync_pattern:set_callback(update_menu_visibility)
+fake_lag_enabled:set_callback(update_menu_visibility)
+fake_lag_pattern:set_callback(update_menu_visibility)
+flick_enabled:set_callback(update_menu_visibility)
+weapon_profiles:set_callback(update_menu_visibility)
+state_override_enabled:set_callback(update_menu_visibility)
+state_override_mode:set_callback(update_menu_visibility)
+state_upper_body_chaos:set_callback(update_menu_visibility)
+resolver_enabled:set_callback(update_menu_visibility)
+resolver_player_overrides:set_callback(update_menu_visibility)
+autostop_enabled:set_callback(update_menu_visibility)
+update_menu_visibility()
 
--- начало нового цикла choke (= новый реально отправляемый пакет)
-local function new_cycle(rt, tk)
-    A.cyc = A.cyc + 1
-    A.since = 0
-
-    -- 1) fake lag
-    if cfg.lag and cfg.lag_n >= 1 then
-        if A.ap_lag_en ~= true then
-            A.ap_lag_en = true
-            acall("override_fake_lag", true)
-            acall("override_fake_lag_variability", 0)       -- разброс делаем сами
-            A.ap_lag_lim = nil
-        end
-        A.want = round(next_lag())
-        if A.ap_lag_lim ~= A.want then A.ap_lag_lim = A.want; acall("override_fake_lag_limit", A.want) end
-    else
-        if A.ap_lag_en ~= false then A.ap_lag_en = false; acall("override_fake_lag", false) end
-        A.want = 1
-    end
-
-    -- 2) inverter
-    local mode   = cfg.inv_mode
-    local manual = U.inv_key:get() and true or false
-    local inv
-    if mode == "Static" then
-        inv = manual
-    elseif mode == "Jitter" then
-        inv = ((floor(A.cyc / cfg.inv_per) % 2) == 1) ~= manual
-    elseif mode == "Random" then
-        if A.cyc >= A.next_flip then
-            A.rnd = not A.rnd
-            A.next_flip = A.cyc + roll_period(cfg.inv_per, cfg.inv_rnd)
-        end
-        inv = (A.rnd ~= manual)
-    else -- Anti-Brute
-        if rt < A.panic_t then
-            if A.cyc >= A.next_flip then
-                A.rnd = not A.rnd
-                A.next_flip = A.cyc + roll_period(max(floor(cfg.inv_per / 2), 1), 60)
-            end
-            inv = (A.rnd ~= manual)
-        else
-            inv = (A.brute ~= manual)
-        end
-    end
-    local flipped = (inv ~= A.inv)
-    A.inv = inv
-
-    -- 3) лимит desync (бросок смещён к максимуму)
-    local maxl, lim = cfg.limit, nil
-    if cfg.rand then
-        local mn = min(cfg.lmin, maxl)
-        if flipped or A.cyc >= A.next_lim or A.lim > maxl or A.lim < mn then
-            local u = random() ^ (1 + 2 * (cfg.lbias / 100))
-            A.lim = clamp(round(maxl - (maxl - mn) * u), mn, maxl)
-            A.next_lim = A.cyc + random(2, 5)
-        end
-        lim = A.lim
-    else
-        lim = maxl
-        A.lim = maxl
-    end
-
-    -- 4) разброс амплитуды модификатора
-    if cfg.mrand and cfg.mod ~= "Spin" and cfg.mod ~= "Disabled" and cfg.amt > 0 then
-        if A.hit_flag or A.cyc >= A.next_amt then
-            local lo = max(0, floor(cfg.amt * 0.6))
-            local hi = max(lo, min(90, floor(cfg.amt * 1.25)))
-            A.amt_eff = random(lo, hi)
-            A.next_amt = A.cyc + random(3, 7)
-            if A.amt_eff ~= A.ap_amt then apply_modifier() end
-        end
-    elseif A.amt_eff then
-        A.amt_eff = nil
-        if A.ap_amt ~= cfg.amt then apply_modifier() end
-    end
-    A.hit_flag = false
-
-    -- 5) defensive flick: ровно один цикл, потом возврат
-    if cfg.def then
-        if A.flick then
-            end_flick()
-        elseif tk >= A.next_flick then
-            A.next_flick = tk + roll_period(max(cfg.def_ev, 2), 40)
-            A.flick = true
-            acall("override_pitch", random(0, 1) == 0 and -89 or 89)
-            acall("override_yaw_offset", random(120, 180) * (random(0, 1) == 0 and -1 or 1))
-        end
-    else
-        end_flick()
-    end
-
-    -- 6) отправляем только изменившееся
-    if A.ap_inv ~= inv then A.ap_inv = inv; acall("override_inverter", inv) end
-    if A.ap_lim ~= lim then A.ap_lim = lim; acall("override_desync_limits", lim, lim) end
-end
-
-local function reset_cache()
-    A.ap_inv, A.ap_lim, A.ap_lag_en, A.ap_lag_lim = nil, nil, nil, nil
-    A.ang_dirty, A.force_cycle = true, true
-    A.cyc, A.since, A.stuck, A.own, A.ch_prev, A.ch_last = 0, 0, 0, 0, 0, nil
-    A.next_flip, A.next_lim, A.next_flick = 0, 0, 0
-    A.last_hp, A.hits_recent, A.panic_t, A.hit_t = nil, 0, 0, 0
-    A.flick, A.tgt_bad, A.capped = false, 0, false
-    A.next_amt, A.amt_eff, A.ap_amt, A.hit_flag = 0, nil, nil, false
-end
-
-local function aa_tick()
-    local rt = clock()
-    if rt >= A.cfg_t then load_cfg(); A.cfg_t = rt + 0.25 end
-
-    if not cfg.en then
-        if A.on then acall("reset"); A.on = false; reset_cache() end
-        return
-    end
-    if not ME.alive then A.was_dead = true; return end        -- мёртв -> молчим
-    if A.was_dead then A.was_dead = false; reset_cache() end  -- респавн -> всё заново
-
-    local tk = globals.tickcount()
-    if not A.on then A.on = true; reset_cache(); A.next_flick = tk + 24 end
-
-    -- раз в 0.5 с принудительно переотправляем (движок мог сбросить overrides)
-    if rt >= A.force_t then
-        A.force_t = rt + 0.5
-        A.ang_dirty = true
-        A.ap_inv, A.ap_lim = nil, nil
-    end
-    if A.ang_dirty then apply_angles() end
-    check_hit(rt)
-
-    -- определяем начало нового цикла choke
-    local lag_on = cfg.lag and cfg.lag_n >= 1
-    local ch = acall("get_choked_ticks")
-    local cyc = false
-    if A.force_cycle then
-        cyc, A.force_cycle = true, false
-    elseif not lag_on then
-        cyc = true
-    elseif type(ch) == "number" then
-        if ch == A.ch_last then A.stuck = A.stuck + 1 else A.stuck = 0 end
-        A.ch_last = ch
-        if A.stuck > 24 then                          -- счётчик движка завис -> считаем сами
-            A.own = A.own + 1
-            if A.own >= A.want then cyc, A.own = true, 0 end
-        else
-            A.own = 0
-            cyc = (ch == 0) or (ch < A.ch_prev)
-        end
-    else
-        A.own = A.own + 1
-        if A.own >= A.want then cyc, A.own = true, 0 end
-    end
-    if type(ch) == "number" then A.ch_prev = ch; A.ch = floor(ch) end
-
-    if cyc then new_cycle(rt, tk) else A.since = A.since + 1 end
-
-    -- движок держит наш лимит? если нет (target больше нашего) - режем сами через unchoke
-    if lag_on and A.since == 1 then
-        local tgt = acall("get_choke_target")
-        if type(tgt) == "number" then
-            A.tgt = round(tgt)
-            if abs(A.tgt - A.want) <= 1 then A.tgt_bad, A.capped = 0, false
-            else
-                A.tgt_bad = A.tgt_bad + 1
-                if A.tgt_bad >= 4 then A.capped = (A.tgt > A.want) end
-            end
-        end
-    end
-    if lag_on and cfg.lag_cap and A.capped and A.ch >= A.want then acall("unchoke") end
-
-    if rt >= A.tw_t then
-        A.tw_t = rt + 0.4
-        local tw = acall("get_twist_deg")
-        A.tw = (type(tw) == "number") and round(tw) or nil
-    end
-end
-
-TICKS[#TICKS + 1] = function()
-    local ok, e = pcall(aa_tick)
-    if not ok then A.err = string.sub(tostring(e), -90) end
-end
-
-HUDS[#HUDS + 1] = { name = "Anti-Aim", fn = function()
-    if not cfg.en then return nil end
-    local rows = {}
-    rows[1] = { "Desync", round(A.lim) .. "°  real " .. (A.inv and "L" or "R") .. "  " .. cfg.mod .. " "
-        .. tostring(A.ap_amt or cfg.amt) .. "°", COL.txt }
-    local lag = "off"
-    if cfg.lag and cfg.lag_n >= 1 then
-        lag = cfg.lag_mode .. " " .. A.ch .. "/" .. A.want .. (A.capped and " cap" or "")
-    end
-    rows[2] = { "Lag", lag .. (A.tw and ("  tw " .. A.tw .. "°") or "") .. (A.flick and "  FLICK" or ""),
-                A.flick and COL.warn or COL.txt }
-    if flags ~= "" then rows[#rows + 1] = { "API", flags, COL.warn } end
-    if A.err ~= "" then rows[#rows + 1] = { "ERR", A.err, COL.bad } end
-    return { title = "ANTI-AIM", rows = rows }
-end }
-
-client.set_event_callback("round_start", function() if A.on then reset_cache() end end)
-STOPS[#STOPS + 1] = function() acall("reset") end
-end -- PART 1
-
-
--- ============================================================
---  PART 2: RESOLVER
--- ============================================================
-do
-local _gs = entity.get_player_slot
-local function get_slot(p)
-    if _gs then
-        local ok, s = pcall(_gs, p)
-        if ok and s ~= nil then return s end
-    end
-    return nil
-end
-local function sid_of(e)                              -- стабильный id врага: UserId -> slot -> Name (слоты переиспользуются)
-    local u = prop(e, "UserId")
-    if u ~= nil then return u end
-    local s = get_slot(e)
-    if s ~= nil then return s end
-    local n = prop(e, "Name")
-    if n ~= nil then return n end
-    return e
-end
-
-local tab  = menu.new_tab("HVH Resolver", ICON)
-local secm = tab:new_section("Main", "Left")
-local secs = tab:new_section("Spread / Learning", "Left")
-
-local U = {}
-U.en        = T(secm, "Enable Resolver", true)
-U.auto_off  = T(secm, "Disable Built-in Resolver", false)
-U.baim      = S(secm, "BAim After Misses", 1, 6, 2, 0, " miss")
-U.step      = S(secm, "Miss Step", 1, 5, 1, 0, " miss")
-U.reset_hit = T(secm, "Reset Misses On Hit", true)
-U.per_state = T(secm, "Separate Memory Per Move State", true)
-U.def       = T(secm, "Defensive Detect (force BAim)", true)
-U.pitch     = T(secm, "Force Enemy Pitch Down", false)
-U.smart_baim = T(secm, "Smart BAim vs hard AA (flip/rand)", true)
-U.meas_on   = T(secm, "Use Measured Desync", true)
-U.meas_src  = C(secm, "Measured Source", { "Auto", "Feet", "Desync" }, "Auto")
-U.pred      = T(secm, "Predict Flip Side (jitter AA)", true)
-U.sp_hard   = T(secm, "Safe Point vs flip/rand/spin (until proven)", true)
-U.sp_conf   = S(secm, "Safe Point if confidence below", 0, 100, 30, 0, "%")
-U.spr_res   = T(secs, "Spread Miss = Resolver Miss", true)
-U.spr_hc    = S(secs, "If shot HC >=", 0, 100, 50, 0, "%")
-U.learn     = T(secs, "Learn Across Sessions", true)
-U.dbg       = T(secs, "Debug Log (console)", false)
-
-local c = { en = true }
-local builtin_prev = nil
-local function builtin_off()
-    if builtin_prev == nil and rage.is_resolver_enabled and rage.set_resolver_enabled then
-        local ok, cur = pcall(rage.is_resolver_enabled)
-        if ok then
-            builtin_prev = cur and true or false
-            pcall(rage.set_resolver_enabled, false)
-        end
-    end
-end
-local function builtin_restore()
-    if builtin_prev ~= nil then
-        pcall(rage.set_resolver_enabled, builtin_prev)
-        builtin_prev = nil
-    end
-end
-
-local function load_cfg()
-    c.en        = U.en:get() and true or false
-    c.auto_off  = U.auto_off:get() and true or false
-    c.baim      = U.baim:get()
-    c.step      = U.step:get()
-    c.reset_hit = U.reset_hit:get() and true or false
-    c.per_state = U.per_state:get() and true or false
-    c.def       = U.def:get() and true or false
-    c.pitch     = U.pitch:get() and true or false
-    c.smart_baim = U.smart_baim:get() and true or false
-    c.meas_on   = U.meas_on:get() and true or false
-    c.src       = U.meas_src:get()
-    c.pred      = U.pred:get() and true or false
-    c.sp_hard   = U.sp_hard:get() and true or false
-    c.sp_conf   = U.sp_conf:get()
-    c.spr_res   = U.spr_res:get() and true or false
-    c.spr_hc    = U.spr_hc:get()
-    c.learn     = U.learn:get() and true or false
-    c.dbg       = U.dbg:get() and true or false
-    if c.en and c.auto_off then builtin_off() else builtin_restore() end
-end
-
--- ---------- обучение: gstats[kind][rel] = {h, s} (общий приор) + mem[id].stats (по врагу) ----------
-local STATS_KEY = "hvh_lite_stats_v9"
-local gstats = {}
-do
-    local ok, saved = pcall(function() return database.read(STATS_KEY) end)
-    if ok and type(saved) == "table" then gstats = saved end
-end
-local mem = {}
-local function save_stats()
-    pcall(function() database.write(STATS_KEY, gstats); database.flush() end)
-end
-
-local KEY = setmetatable({}, { __index = function(t, k) local s = tostring(k); t[k] = s; return s end })
-local function entry(tbl, kind, key)
-    local kt = tbl[kind]
-    if type(kt) ~= "table" then kt = {}; tbl[kind] = kt end
-    local e = kt[key]
-    if type(e) ~= "table" then e = { h = 0, s = 0 }; kt[key] = e end
-    return e
-end
-local function credit(st, kind, rel, hit)
-    local k = KEY[rel]
-    local e = entry(st.m.stats, kind, k)
-    e.s = e.s + 1
-    if hit then e.h = e.h + 1 end
-    if e.s > 30 then e.h = e.h * 0.5; e.s = e.s * 0.5 end
-    local g = entry(gstats, kind, k)
-    g.s = g.s + 1
-    if hit then g.h = g.h + 1 end
-    if g.s > 60 then g.h = g.h * 0.5; g.s = g.s * 0.5 end
-end
-local function score(st, kind, rel)
-    local k = KEY[rel]
-    local gk = gstats[kind]
-    local g = gk and gk[k]
-    local pg = g and ((g.h + 1) / (g.s + 2)) or 0.5
-    local sk = st.m.stats[kind]
-    local e = sk and sk[k]
-    if not e then return pg end
-    return (e.h + 2 * pg) / (e.s + 2)
-end
-
--- ---------- кандидаты: числа умножаются на сторону desync врага ----------
-local MEAS, MEAS_INV, MAXD, MAXDN, PRED, MID = 999, 998, 997, 996, 995, 994
-local function needs_meas(r) return r == MEAS or r == MEAS_INV or r == PRED end
-local ORDER = {
-    static  = { MEAS, MAXD, MEAS_INV, 0, MAXDN, 86, -86, 58, -58, 30, -30 },
-    flip    = { PRED, MEAS_INV, MEAS, MAXD, MAXDN, 0, 58, -58, 86, -86, 30, -30 },
-    rand    = { MID, MAXD, MAXDN, MEAS, MEAS_INV, 0, 58, -58, 86, -86, 30, -30 },
-    spin    = { MEAS, 0, MAXD, MAXDN, 86, -86, MEAS_INV, 58, -58, 30, -30 },
-    unknown = { MEAS, MAXD, MEAS_INV, 0, MAXDN, 86, -86, 58, -58, 30, -30 },
+local config_controls = {
+master = master,
+aa_enabled = aa_enabled,
+pitch_mode = pitch_mode,
+custom_pitch = custom_pitch,
+pitch_jitter_pattern = pitch_jitter_pattern,
+pitch_jitter_a = pitch_jitter_a,
+pitch_jitter_b = pitch_jitter_b,
+pitch_jitter_center = pitch_jitter_center,
+pitch_jitter_speed = pitch_jitter_speed,
+pitch_mega_sequence = pitch_mega_sequence,
+yaw_base = yaw_base,
+yaw_offset = yaw_offset,
+adaptive_aa = adaptive_aa,
+yaw_modifier = yaw_modifier,
+modifier_amount = modifier_amount,
+yaw_pattern_period = yaw_pattern_period,
+yaw_asymmetric_left = yaw_asymmetric_left,
+yaw_asymmetric_right = yaw_asymmetric_right,
+yaw_asymmetric_left_hold = yaw_asymmetric_left_hold,
+yaw_asymmetric_right_hold = yaw_asymmetric_right_hold,
+yaw_sequence = yaw_sequence,
+yaw_wave_period = yaw_wave_period,
+yaw_spin_speed = yaw_spin_speed,
+manual_direction_enabled = manual_direction_enabled,
+desync_enabled = desync_enabled,
+desync_limit = desync_limit,
+auto_invert = auto_invert,
+invert_interval = invert_interval,
+show_fake = show_fake,
+fake_lag_enabled = fake_lag_enabled,
+fake_lag_limit = fake_lag_limit,
+fake_lag_variability = fake_lag_variability,
+unchoke_on_shot = unchoke_on_shot,
+desync_pattern = desync_pattern,
+desync_left_min = desync_left_min,
+desync_left_max = desync_left_max,
+desync_right_min = desync_right_min,
+desync_right_max = desync_right_max,
+desync_pattern_period = desync_pattern_period,
+desync_sequence = desync_sequence,
+desync_real = desync_real,
+desync_fake = desync_fake,
+desync_mirror_explicit = desync_mirror_explicit,
+fake_lag_pattern = fake_lag_pattern,
+fake_lag_min = fake_lag_min,
+fake_lag_pattern_period = fake_lag_pattern_period,
+fake_lag_sequence = fake_lag_sequence,
+state_override_enabled = state_override_enabled,
+state_override_mode = state_override_mode,
+state_on_stand = state_on_stand,
+state_on_run = state_on_run,
+state_on_duck = state_on_duck,
+state_on_air = state_on_air,
+state_pitch = state_pitch,
+state_yaw_base = state_yaw_base,
+state_yaw_offset = state_yaw_offset,
+state_spin_direction = state_spin_direction,
+state_spin_speed = state_spin_speed,
+state_madness_period = state_madness_period,
+state_madness_pitch_min = state_madness_pitch_min,
+state_madness_pitch_max = state_madness_pitch_max,
+state_madness_yaw_range = state_madness_yaw_range,
+state_madness_desync = state_madness_desync,
+state_upper_body_chaos = state_upper_body_chaos,
+state_body_chaos_strength = state_body_chaos_strength,
+state_disable_fake_lag = state_disable_fake_lag,
+flick_enabled = flick_enabled,
+flick_yaw = flick_yaw,
+flick_pitch = flick_pitch,
+flick_ticks = flick_ticks,
+flick_rest_ticks = flick_rest_ticks,
+flick_bind_mode = flick_bind_mode,
+rage_enabled = rage_enabled,
+weapon_profiles = weapon_profiles,
+min_damage = min_damage,
+hitchance = hitchance,
+sniper_damage = sniper_damage,
+sniper_hitchance = sniper_hitchance,
+target_selection = target_selection,
+hitbox_preset = hitbox_preset,
+auto_scope = auto_scope,
+resolver_enabled = resolver_enabled,
+resolver_mode = resolver_mode,
+resolver_miss_limit = resolver_miss_limit,
+resolver_baim_after = resolver_baim_after,
+resolver_player_overrides = resolver_player_overrides,
+resolver_brute_sequence = resolver_brute_sequence,
+resolver_reset_on_hit = resolver_reset_on_hit,
+resolver_lock_on_hit = resolver_lock_on_hit,
+resolver_freestand_seed = resolver_freestand_seed,
+resolver_safe_on_baim = resolver_safe_on_baim,
+autostop_enabled = autostop_enabled,
+autostop_choke_ticks = autostop_choke_ticks,
+autostop_min_speed = autostop_min_speed,
+autostop_duck = autostop_duck,
 }
-local function rel_name(r)
-    if r == MEAS then return "meas" end
-    if r == MEAS_INV then return "-meas" end
-    if r == MAXD then return "max" end
-    if r == MAXDN then return "-max" end
-    if r == PRED then return "pred" end
-    if r == MID then return "mid" end
-    return tostring(r)
-end
-local function rel_off(rel, side, st)
-    if rel == MEAS then return st.meas or 0 end
-    if rel == MEAS_INV then return -(st.meas or 0) end
-    if rel == MAXD then return st.m.maxd * side end
-    if rel == MAXDN then return -st.m.maxd * side end
-    if rel == PRED then return st.pred_off or st.meas or 0 end
-    if rel == MID then return st.m.mid * side end
-    return rel * side
-end
-local function cand_norm(rel, st) return rel_off(rel, st.side, st) * st.side end
 
-local function mark_tried(st, bk, rel)
-    if rel == nil then return end
-    bk.tried[rel] = true
-    bk.tn[#bk.tn + 1] = cand_norm(rel, st)
-end
-local function clear_tried(bk)
-    for k in pairs(bk.tried) do bk.tried[k] = nil end
-    for i = #bk.tn, 1, -1 do bk.tn[i] = nil end
-end
-local function dup_tried(bk, st, rel)
-    local v = cand_norm(rel, st)
-    for i = 1, #bk.tn do
-        if abs(bk.tn[i] - v) <= 3 then return true end
-    end
-    return false
-end
-local function pick(st, kind, bk, has_meas, retry)
-    local list = ORDER[kind] or ORDER.unknown
-    local best, best_score
-    for i = 1, #list do
-        local rel = list[i]
-        if not bk.tried[rel] and (has_meas or not needs_meas(rel)) and not dup_tried(bk, st, rel) then
-            local sc = score(st, kind, rel)
-            if not best_score or sc > best_score + 1e-9 then best, best_score = rel, sc end
-        end
-    end
-    if best == nil then                               -- все пробовали: новый круг, лучшим по статистике
-        clear_tried(bk)
-        if retry then
-            if has_meas then return MEAS end
-            return 0
-        end
-        return pick(st, kind, bk, has_meas, true)
-    end
-    return best
-end
+local DEFAULT_PRESET = {
+master = false,
 
--- ---------- состояния врагов ----------
-local FH = 12
-local states, next_id = {}, 1
-local fires, last_fire = {}, nil
-local enemies, eids, ecount, present = {}, {}, 0, {}
-local keymap = {}
-local next_scan, next_cfg, last_tk = 0, 0, 0
-local next_save = clock() + 60
-local ev_n = { fire = 0, hit = 0, miss = 0, res = 0, spr = 0, spr_res = 0, occ = 0, dth = 0, unm = 0 }
-local ev_last, unm_info = "-", ""
-local dbg_log, diag = {}, { fire = 0, hit = 0, miss = 0 }
-local active = false
-local rerr, perr_txt, perr = "", "", {}
+aa_enabled = false,
+pitch_mode = "Down",
+custom_pitch = -89,
+pitch_jitter_pattern = "2-Way",
+pitch_jitter_a = -89,
+pitch_jitter_b = 89,
+pitch_jitter_center = 0,
+pitch_jitter_speed = 1,
+pitch_mega_sequence = "A,B,0,-A,A,-B,B,R",
+yaw_base = "Backward",
+yaw_offset = 0,
+adaptive_aa = false,
+yaw_modifier = "Random",
+modifier_amount = 26,
+yaw_pattern_period = 4,
+yaw_asymmetric_left = -32,
+yaw_asymmetric_right = 26,
+yaw_asymmetric_left_hold = 1,
+yaw_asymmetric_right_hold = 1,
+yaw_sequence = "-40:2,40:2,0:1",
+yaw_wave_period = 64,
+yaw_spin_speed = 120,
+manual_direction_enabled = false,
 
-local function get_state(id)
-    local st = states[id]
-    if st then return st end
-    local m = mem[id]
-    if not m then m = { stats = {}, maxd = 58, mid = 58 }; mem[id] = m end
-    st = {
-        n = next_id, id = id, m = m,
-        f = {}, e = {}, ey = nil, fy = nil, d = nil, same = 0,
-        kind = "unknown", fkind = "unknown", ekind = "other",
-        side = 1, meas = nil,
-        buckets = {}, total_miss = 0, spread_streak = 0,
-        mv = nil, rel = 0, off = 0, bkt = "Standing",
-        hits = 0, shots = 0, def_until = 0, pc = {}, next_force = 0,
-        runs = {}, rsign = nil, rt0 = 0, pred_off = nil, per = nil,
-        name = nil, seen = clock(), dead = false,
-    }
-    next_id = next_id + 1
-    states[id] = st
-    return st
-end
+desync_enabled = false,
+desync_limit = 85,
+auto_invert = false,
+invert_interval = 1,
+show_fake = false,
+fake_lag_enabled = false,
+fake_lag_limit = 0,
+fake_lag_variability = 100,
+unchoke_on_shot = false,
+desync_pattern = "Static",
+desync_left_min = 20,
+desync_left_max = 85,
+desync_right_min = 20,
+desync_right_max = 85,
+desync_pattern_period = 8,
+desync_sequence = "30:2,58:1,40:1",
+desync_real = 25,
+desync_fake = -25,
+desync_mirror_explicit = false,
+fake_lag_pattern = "Static",
+fake_lag_min = 2,
+fake_lag_pattern_period = 8,
+fake_lag_sequence = "2:1,6:2,4:1",
 
-local function get_bucket(st, name)
-    local b = st.buckets[name]
-    if not b then
-        b = { cur = nil, cur_kind = nil, tried = {}, tn = {}, step_miss = 0, good = nil, good_rel = nil }
-        st.buckets[name] = b
-    end
-    return b
-end
+state_override_enabled = false,
+state_override_mode = "Spin",
+state_on_stand = false,
+state_on_run = false,
+state_on_duck = false,
+state_on_air = false,
+state_pitch = 0,
+state_yaw_base = "Backward",
+state_yaw_offset = 0,
+state_spin_direction = "Right",
+state_spin_speed = 720,
+state_madness_period = 2,
+state_madness_pitch_min = -89,
+state_madness_pitch_max = 89,
+state_madness_yaw_range = 180,
+state_madness_desync = false,
+state_upper_body_chaos = false,
+state_body_chaos_strength = 65,
+state_disable_fake_lag = false,
 
--- смерть / респавн / новый раунд: чистим только быструю историю. Рабочие углы (bk.good),
--- статистика, hits/shots, kind и maxd сохраняются -> новая жизнь начинается с известного угла.
-local function reset_transient(st)
-    st.f, st.e, st.runs = {}, {}, {}
-    st.ey, st.fy, st.d, st.same = nil, nil, nil, 0
-    st.fkind, st.ekind = "unknown", "other"
-    st.meas, st.pred_off, st.per, st.rsign, st.rt0 = nil, nil, nil, nil, 0
-    st.def_until, st.next_force, st.pc, st.mv = 0, 0, {}, nil
-    st.total_miss, st.spread_streak = 0, 0
-    for _, bk in pairs(st.buckets) do
-        bk.step_miss, bk.cur, bk.cur_kind = 0, nil, nil
-        clear_tried(bk)
-    end
-end
-local function reset_all_transient()
-    for _, st in pairs(states) do reset_transient(st) end
+flick_enabled = false,
+flick_yaw = 180,
+flick_pitch = -89,
+flick_ticks = 8,
+flick_rest_ticks = 8,
+flick_bind_mode = "Hold",
+
+rage_enabled = false,
+weapon_profiles = false,
+min_damage = 30,
+hitchance = 55,
+sniper_damage = 60,
+sniper_hitchance = 65,
+target_selection = "Near crosshair",
+hitbox_preset = "All",
+auto_scope = false,
+
+resolver_enabled = false,
+resolver_mode = "Adaptive",
+resolver_miss_limit = 2,
+resolver_baim_after = 2,
+resolver_player_overrides = false,
+resolver_brute_sequence = "58,-58,0,86,-86,29,-29",
+resolver_reset_on_hit = false,
+resolver_lock_on_hit = false,
+resolver_freestand_seed = false,
+resolver_safe_on_baim = false,
+
+autostop_enabled = false,
+autostop_choke_ticks = 3,
+autostop_min_speed = 10,
+autostop_duck = false
+}
+
+local function apply_config_values(values)
+if type(values) ~= "table" then
+return false
 end
 
--- уверенность резольвера (0..1): тип AA, рабочий угол, статистика кандидата, промахи
-local function conf_of(st, bk)
-    local conf
-    if bk and bk.good then
-        conf = 0.9
-        if st.shots >= 4 then conf = conf * (0.4 + 0.6 * (st.hits / st.shots)) end
-    else
-        local kind = st.kind
-        if kind == "static" then conf = st.meas and 0.75 or 0.55
-        elseif kind == "flip" then conf = st.pred_off and 0.6 or 0.35
-        elseif kind == "rand" or kind == "spin" then conf = 0.3
-        else conf = 0.45 end
-        local sc = 0.5
-        if st.rel ~= nil then sc = score(st, kind, st.rel) end
-        conf = conf * (0.6 + 0.8 * sc) * (0.75 ^ st.total_miss)
-    end
-    return clamp(conf, 0, 1)
-end
-
-local function dbg(line)
-    line = tostring(line)
-    dbg_log[#dbg_log + 1] = line
-    if #dbg_log > 5 then table.remove(dbg_log, 1) end
-    print("[resolver] " .. line)
-end
-
-local function pset(en, st, key, val, force)
-    local pc = st.pc
-    if force or pc[key] ~= val then
-        pc[key] = val
-        if not pcall(plist.set, en, key, val) and not perr[key] then
-            perr[key] = true
-            perr_txt = perr_txt .. " [" .. key .. "]"
-        end
-    end
-end
-
--- ---------- классификация ----------
--- по измеренному углу desync (feet - eye): static / flip (сторона прыгает) / rand
-local function classify_fr(st)
-    local f, n = st.f, #st.f
-    if n < 4 then return "unknown" end
-    local flips, steps = 0, 0
-    for j = 2, n do
-        local cur, prev = f[j], f[j - 1]
-        if abs(cur) >= 12 and abs(prev) >= 12 then
-            steps = steps + 1
-            if (cur < 0) ~= (prev < 0) then flips = flips + 1 end
-        end
-    end
-    if steps < 3 then return "static" end
-    local ratio = flips / steps
-    if ratio >= 0.5 then return "flip" end
-    if ratio <= 0.15 then return "static" end
-    return "rand"
-end
-
--- по eye yaw: spin и defensive (разворот >120 за кадр после спокойного периода)
-local function classify_eye(st)
-    local e, n = st.e, #st.e
-    if n < 6 then return "other", false end
-    local sum, sum_abs, prev_abs, last_d = 0, 0, 0, 0
-    for k = 2, n do
-        local d = wrap(e[k] - e[k - 1])
-        local ad = abs(d)
-        if k < n then prev_abs = prev_abs + ad end
-        sum, sum_abs, last_d = sum + d, sum_abs + ad, d
-    end
-    local cnt = n - 1
-    local defensive = abs(last_d) > 120 and (prev_abs / (cnt - 1)) < 25
-    local spin = (abs(sum) > sum_abs * 0.7) and (sum_abs / cnt) > 5
-    return (spin and "spin" or "other"), defensive
-end
-
--- ---------- предсказание стороны flip/jitter AA ----------
-local function track_runs(st, mx, rt)
-    if abs(mx) < 12 then return end
-    local sg = (mx < 0) and -1 or 1
-    if st.rsign == nil then
-        st.rsign, st.rt0 = sg, rt
-    elseif st.rsign ~= sg then
-        local r = st.runs
-        r[#r + 1] = rt - st.rt0
-        if #r > 6 then table.remove(r, 1) end
-        st.rsign, st.rt0 = sg, rt
-    end
-end
-
-local function update_pred(st, rt)
-    st.pred_off, st.per = nil, nil
-    local r = st.runs
-    local n = #r
-    if n < 3 or not st.meas or st.rsign == nil then return end
-    local lo, hi, sum, cnt = 1e9, 0, 0, 0
-    for i = max(1, n - 3), n do
-        local v = r[i]
-        if v < lo then lo = v end
-        if v > hi then hi = v end
-        sum, cnt = sum + v, cnt + 1
-    end
-    if lo < 0.02 or hi > lo * 1.6 then return end     -- серии нерегулярные -> не предсказываем
-    local per = sum / cnt
-    st.per = per
-    local lead = 0.06
-    if client.latency then
-        local ok, l = pcall(client.latency)
-        if ok and type(l) == "number" then lead = clamp(l, 0.02, 0.25) end
-    end
-    local flips = floor(((rt - st.rt0) + lead) / per)
-    local s = st.rsign
-    if flips % 2 == 1 then s = -s end
-    st.pred_off = s * abs(st.meas)
-end
-
--- ---------- обработка одного врага ----------
-local function push(arr, v, n)
-    arr[#arr + 1] = v
-    if #arr > n then table.remove(arr, 1) end
-end
-
-local function process(en, id, tk, rt)
-    local st = states[id] or get_state(id)
-    if not st.name then st.name = prop(en, "DisplayName") or prop(en, "Name") or tostring(id) end
-    local anim = entity.get_anim_state(en)
-
-    if anim then
-        local ey, fy, d = anim.eye_angles_y, anim.goal_feet_yaw, anim.desync
-        if type(d) ~= "number" then d = 0 end
-        -- "пакет": eye yaw обновился либо ноги резко прыгнули. Плавное сглаживание в историю не пишем.
-        local packet = false
-        if type(ey) == "number" then
-            if ey ~= st.ey then packet = true
-            elseif type(fy) == "number" and st.fy and abs(wrap(fy - st.fy)) > 20 then packet = true end
-        elseif d ~= st.d then
-            packet = true
-        end
-
-        if packet or fy ~= st.fy or d ~= st.d then
-            local fr = (type(ey) == "number" and type(fy) == "number") and wrap(fy - ey) or nil
-            local mx
-            if c.src == "Desync" then mx = d elseif c.src == "Feet" then mx = fr else mx = fr or d end
-
-            if packet then
-                if type(ey) == "number" and ey ~= st.ey then
-                    push(st.e, ey, 16)
-                    local ek, defensive = classify_eye(st)
-                    st.ekind = ek
-                    if defensive and c.def then st.def_until = tk + 14 end
-                end
-                if type(mx) == "number" then
-                    push(st.f, mx, FH)
-                    st.fkind = classify_fr(st)
-                    track_runs(st, mx, rt)
-                end
-            end
-
-            if type(mx) == "number" then
-                if c.meas_on and abs(mx) >= 12 then
-                    st.meas = clamp(mx, -86, 86)
-                    local a = abs(st.meas)
-                    if a > st.m.maxd then st.m.maxd = a else st.m.maxd = max(25, st.m.maxd * 0.999) end
-                    st.m.mid = st.m.mid * 0.92 + a * 0.08
-                else
-                    st.meas = nil
-                end
-            end
-            if st.meas then st.side = sgn(st.meas)
-            elseif abs(d) > 6 then st.side = sgn(d) end
-
-            st.ey, st.fy, st.d, st.same = ey, fy, d, 0
-            if st.ekind == "spin" then st.kind = "spin"
-            elseif st.fkind ~= "unknown" then st.kind = st.fkind end
-        else
-            st.same = st.same + 1
-            if st.same >= 24 then st.kind = "static" end
-        end
-    end
-
-    -- состояние движения раз в 4 тика
-    if not st.mv or (tk + st.n) % 4 == 0 then
-        local mvs = "All"
-        if c.per_state then
-            mvs = "Standing"
-            if movement and movement.get_state then
-                local ok, r = pcall(movement.get_state, en)
-                if ok and r then mvs = r end
-            end
-        end
-        st.mv = mvs
-    end
-
-    if c.pred and st.kind == "flip" then update_pred(st, rt) else st.pred_off, st.per = nil, nil end
-
-    -- выбор угла: рабочий (который попал) -> иначе лучший по статистике
-    local bk = get_bucket(st, st.mv)
-    local has_meas = st.meas ~= nil
-    local rel
-    if bk.good then
-        rel = bk.good_rel or 0
-    else
-        if bk.cur and needs_meas(bk.cur) and not has_meas then bk.cur = nil end
-        if not bk.cur or (bk.cur_kind ~= st.kind and bk.step_miss == 0 and next(bk.tried) == nil) then
-            bk.cur, bk.cur_kind = pick(st, st.kind, bk, has_meas), st.kind
-        end
-        rel = bk.cur
-    end
-    local off = round(rel_off(rel, st.side, st))
-    st.rel, st.off, st.bkt = rel, off, st.mv
-
-    local force = false
-    if rt >= st.next_force then force = true; st.next_force = rt + 0.5 + (st.n % 5) * 0.1 end
-
-    -- как в примере из доки: Force body yaw + offset каждый тик
-    pset(en, st, "Force body yaw", true, true)
-    pset(en, st, "Override yaw offset", off, true)
-
-    -- политика: против нестабильного AA и при низкой уверенности меняем урон на гарантию попадания
-    local kd = st.kind
-    local hardk  = (kd == "flip" or kd == "rand" or kd == "spin")
-    local proven = bk.good ~= nil and st.hits * 2 >= st.shots          -- рабочий угол + нормальный % попаданий
-    local hard = c.smart_baim and hardk and st.shots >= 3 and st.hits * 3 < st.shots
-    local baim = st.total_miss >= c.baim or tk < st.def_until or hard
-    pset(en, st, "Override prefer body aim", baim and "Force" or "-", force)
-    local sp = st.total_miss >= c.baim + 1
-    if c.sp_hard and not sp and hardk and not proven then sp = true end
-    if c.sp_conf > 0 and not sp and not proven and conf_of(st, bk) * 100 < c.sp_conf then sp = true end
-    pset(en, st, "Override safe point", sp and "Force" or "-", force)
-
-    if c.pitch then
-        pset(en, st, "Force pitch", true, force)
-        pset(en, st, "Force pitch value", 89, force)
-    else
-        pset(en, st, "Force pitch", false, force)
-    end
-end
-
--- ---------- список врагов + таблица идентификаторов ----------
-local function index_enemy(e, id)
-    keymap[e] = id
-    keymap[id] = id
-    local n = prop(e, "Name")
-    if n ~= nil then keymap[n] = id; keymap[string.lower(tostring(n))] = id end
-    local dn = prop(e, "DisplayName")
-    if dn ~= nil then keymap[string.lower(tostring(dn))] = id end
-    local u = prop(e, "UserId")
-    if u ~= nil then keymap[u] = id end
-    local ch = prop(e, "Character")
-    if ch ~= nil then keymap[ch] = id end
-    local s = get_slot(e)
-    if s ~= nil then keymap[s] = id end
-end
-
-local function scan()
-    local list = entity.get_enemies()
-    if type(list) ~= "table" then return end
-    local n = 0
-    for k in pairs(present) do present[k] = nil end
-    for i = 1, #list do
-        local e = list[i]
-        if entity.is_alive(e) then
-            local id = sid_of(e)
-            n = n + 1
-            enemies[n], eids[n] = e, id
-            present[id] = true
-            index_enemy(e, id)
-        end
-    end
-    for i = n + 1, ecount do enemies[i], eids[i] = nil, nil end
-    ecount = n
-    local now = clock()
-    for id, st in pairs(states) do
-        if present[id] then
-            st.seen, st.dead = now, false
-        else
-            if not st.dead then st.dead = true; reset_transient(st) end
-            if now - (st.seen or now) > 180 then states[id] = nil end   -- ушёл с сервера
-        end
-    end
-end
-
-local function resolver_tick()
-    local rt = clock()
-    if rt >= next_cfg then load_cfg(); next_cfg = rt + 0.25 end
-
-    if not c.en then
-        if active then
-            plist.reset_all()
-            states, fires, last_fire = {}, {}, nil
-            builtin_restore()
-            active = false
-        end
-        return
-    end
-    active = true
-
-    local tk = globals.tickcount()
-    if tk < last_tk then reset_all_transient(); fires, last_fire, next_scan = {}, nil, 0 end
-    last_tk = tk
-
-    if rt >= next_scan then scan(); next_scan = rt + 0.25 end
-    if c.learn and rt >= next_save then next_save = rt + 60; save_stats() end
-
-    for i = 1, ecount do
-        local ok, e = pcall(process, enemies[i], eids[i], tk, rt)
-        if not ok then rerr = string.sub(tostring(e), -90) end
-    end
-end
-
-TICKS[#TICKS + 1] = function()
-    local ok, e = pcall(resolver_tick)
-    if not ok then rerr = string.sub(tostring(e), -90) end
-end
-
--- ---------- события выстрелов: цель ищем ВСЕМИ способами ----------
-local LOOK = { "slot", "player", "entity", "target", "Name", "name", "UserId", "userid", "index", "id", "Parent", "Character" }
-
-local function lookup(t)
-    if t == nil then return nil end
-    local id = keymap[t]
-    if id ~= nil then return id end
-    local tt = type(t)
-    if tt == "string" then return keymap[string.lower(t)] end
-    if tt == "number" or tt == "boolean" then return nil end
-    for i = 1, #LOOK do                               -- таблица / Instance: типичные поля
-        local v = prop(t, LOOK[i])
-        if v ~= nil and v ~= t then
-            id = keymap[v]
-            if id == nil and type(v) == "string" then id = keymap[string.lower(v)] end
-            if id ~= nil then return id end
-        end
-    end
-    return nil
-end
-
-local function nearest(pt)                            -- враг, ближайший к точке прицеливания
-    local best, bd = nil, 15
-    for i = 1, ecount do
-        local ok, pos = pcall(entity.get_player_position, enemies[i])
-        if ok and pos ~= nil then
-            local ok2, dd = pcall(function() return (pos - pt).Magnitude end)
-            if ok2 and type(dd) == "number" and dd < bd then best, bd = eids[i], dd end
-        end
-    end
-    return best
-end
-
-local function find_id(e)
-    local id = lookup(e.target)
-    if id == nil then scan(); id = lookup(e.target) end          -- возможно, список устарел
-    if id == nil and e.point ~= nil then id = nearest(e.point) end
-    if id == nil then
-        local ok, t = pcall(rage.get_target)
-        if ok and t ~= nil then id = lookup(t) end
-    end
-    if id == nil and ecount == 1 then id = eids[1] end
-    return id
-end
-
-local function ev(a, b, cc)                           -- понимаем и таблицу e, и позиционные аргументы
-    if type(a) == "table" then
-        local t = prop(a, "target")
-        if t ~= nil then return a end
-        if prop(a, "id") ~= nil then return a end
-    end
-    return { target = a, hitbox = b, reason = (type(cc) == "string") and cc or nil }
-end
-
-local function diag_log(kind, e)                      -- первые 3 события каждого вида: что именно приходит
-    if diag[kind] >= 3 then return end
-    diag[kind] = diag[kind] + 1
-    local t = e.target
-    print("[resolver] diag " .. kind .. ": target=" .. type(t) .. ":" .. tostring(t) .. " id=" .. tostring(e.id)
-        .. " reason=" .. tostring(e.reason) .. " hitbox=" .. tostring(e.hitbox))
-end
-
-local function note_unm(kind, e)                     -- что именно не нашлось (виден на HUD)
-    ev_n.unm = ev_n.unm + 1
-    unm_info = kind .. " t=" .. type(e.target) .. ":" .. tostring(e.target) .. " id=" .. tostring(e.id)
-        .. " r=" .. tostring(e.reason)
-end
-
--- состояние + запись о выстреле для hit / miss
-local function shot_for(e)
-    local f = nil
-    if e.id ~= nil then f = fires[e.id]; fires[e.id] = nil end
-    local st = f and f.st
-    if not st then
-        local id = find_id(e)
-        st = id ~= nil and states[id] or nil
-        if not st then
-            -- цель события не опознана: берём наш последний выстрел (результат приходит сразу за ним)
-            if last_fire and clock() - last_fire.t < 3 then f = last_fire; st = f.st
-            else return nil, nil end
-        end
-    end
-    if not f and last_fire and last_fire.st == st then f = last_fire end
-    if f == last_fire then last_fire = nil end
-    if not f then f = { st = st, rel = st.rel, off = st.off, kind = st.kind, bkt = st.bkt, t = clock() } end
-    return st, f
-end
-
-client.set_event_callback("aim_fire", function(a, b, cc)
-    local e = ev(a, b, cc)
-    ev_n.fire = ev_n.fire + 1
-    diag_log("fire", e)
-    local id = find_id(e)
-    local st = id ~= nil and states[id] or nil
-    if not st then note_unm("fire", e) return end
-    st.shots = st.shots + 1
-    if st.shots > 24 then st.shots, st.hits = st.shots * 0.5, st.hits * 0.5 end
-    local hc = e.hitchance
-    if type(hc) == "number" then
-        if hc <= 0 then hc = nil elseif hc <= 1 then hc = hc * 100 end
-    end
-    local now = clock()
-    local f = { st = st, rel = st.rel, off = st.off, kind = st.kind, bkt = st.bkt, hc = hc, t = now }
-    if e.id ~= nil then
-        fires[e.id] = f
-        for k, old in pairs(fires) do                 -- чистим потерянные выстрелы
-            if now - old.t > 6 then fires[k] = nil end
-        end
-    end
-    last_fire = f
-    if c.dbg then
-        dbg("fire kind=" .. st.kind .. " rel=" .. rel_name(st.rel) .. " off=" .. st.off
-            .. " meas=" .. tostring(st.meas and round(st.meas)) .. " hc=" .. tostring(hc and round(hc)))
-    end
-end)
-
-client.set_event_callback("aim_hit", function(a, b, cc)
-    local e = ev(a, b, cc)
-    ev_n.hit = ev_n.hit + 1
-    diag_log("hit", e)
-    local st, f = shot_for(e)
-    if not st then note_unm("hit", e) return end
-    local bk = get_bucket(st, f.bkt or st.bkt)
-    st.hits = st.hits + 1
-    st.spread_streak = 0
-    credit(st, f.kind, f.rel, true)
-    bk.good, bk.good_rel, bk.step_miss = f.off, f.rel, 0
-    clear_tried(bk)
-    if c.reset_hit then st.total_miss = 0 end
-    if c.dbg then dbg("HIT kind=" .. f.kind .. " rel=" .. rel_name(f.rel) .. " off=" .. f.off) end
-end)
-
-client.set_event_callback("aim_miss", function(a, b, cc)
-    local e = ev(a, b, cc)
-    ev_n.miss = ev_n.miss + 1
-    diag_log("miss", e)
-    ev_last = tostring(e.reason)
-    local st, f = shot_for(e)
-    if not st then note_unm("miss", e) return end
-
-    -- reason по доке: "resolver" | "spread" | "occlusion" | "death". Нет причины - считаем resolver.
-    local r = e.reason and string.lower(tostring(e.reason)) or ""
-    if string.find(r, "occlu", 1, true) then ev_n.occ = ev_n.occ + 1 return end
-    if string.find(r, "death", 1, true) or string.find(r, "dead", 1, true) then ev_n.dth = ev_n.dth + 1 return end
-    if string.find(r, "spread", 1, true) then
-        ev_n.spr = ev_n.spr + 1
-        -- движок часто пишет "spread" на промахи резольвера: высокий HC выстрела или 2-й подряд -> наказываем
-        local count = false
-        if c.spr_res then
-            local bk0 = get_bucket(st, f.bkt or st.bkt)
-            if bk0.good then count = st.spread_streak >= 1
-            elseif f.hc == nil or f.hc >= c.spr_hc or st.spread_streak >= 1 then count = true end
-        end
-        if not count then
-            st.spread_streak = st.spread_streak + 1
-            if c.dbg then dbg("miss(spread, ignored)") end
-            return
-        end
-        ev_n.spr_res = ev_n.spr_res + 1
-    end
-    ev_n.res = ev_n.res + 1
-    st.spread_streak = 0
-
-    local bk = get_bucket(st, f.bkt or st.bkt)
-    credit(st, f.kind, f.rel, false)
-    st.total_miss = st.total_miss + 1
-    bk.step_miss = bk.step_miss + 1
-    if c.dbg then
-        dbg("MISS(" .. r .. ") kind=" .. f.kind .. " rel=" .. rel_name(f.rel) .. " off=" .. f.off .. " total=" .. st.total_miss)
-    end
-
-    if bk.good then                                   -- у рабочего угла запас на 1 промах
-        if bk.step_miss >= c.step + 1 then
-            mark_tried(st, bk, bk.good_rel)
-            bk.good, bk.good_rel, bk.step_miss, bk.cur = nil, nil, 0, nil
-        end
-    elseif bk.step_miss >= c.step then
-        mark_tried(st, bk, f.rel or bk.cur)
-        bk.step_miss, bk.cur = 0, nil
-    end
-end)
-
-client.set_event_callback("round_start", function()
-    reset_all_transient()
-    fires, last_fire, next_scan = {}, nil, 0
-end)
-
-secm:new_button("Reset Learned Angles", function()
-    gstats = {}
-    for _, m in pairs(mem) do m.stats = {} end
-    for _, st in pairs(states) do st.buckets, st.total_miss, st.spread_streak = {}, 0, 0 end
-    save_stats()
-end)
-
--- ---------- HUD ----------
-HUDS[#HUDS + 1] = { name = "Resolver", fn = function()
-    if not c.en then return nil end
-    local rows = {}
-    local ok, t = pcall(rage.get_target)
-    local st
-    if ok and t ~= nil then
-        local id = lookup(t)
-        st = id ~= nil and states[id] or nil
-    end
-    if st then
-        local bk = get_bucket(st, st.bkt)
-        local cf = conf_of(st, bk)
-        local ccol = (cf >= 0.66 and COL.ok) or (cf >= 0.4 and COL.warn) or COL.bad
-        rows[1] = { "Target", tostring(st.name) .. "  [" .. st.kind .. "]", COL.txt }
-        rows[2] = { "Angle", (st.off >= 0 and "+" or "") .. round(st.off) .. "°  " .. rel_name(st.rel)
-            .. (st.per and ("  " .. floor(st.per * 1000) .. "ms") or ""), COL.txt }
-        rows[3] = { "Conf", round(cf * 100) .. "%", ccol, cf }
-        local sttxt, stcol = "SEARCH", COL.dim
-        if globals.tickcount() < st.def_until then sttxt, stcol = "DEFENSIVE", COL.warn
-        elseif bk.good then sttxt, stcol = "LOCKED", COL.ok end
-        local hr = st.shots > 0 and floor(st.hits / st.shots * 100) or 0
-        rows[4] = { "State", sttxt .. "  " .. floor(st.hits) .. "/" .. floor(st.shots) .. " " .. hr .. "%  m" .. st.total_miss, stcol }
-    else
-        rows[1] = { "Tracked", ecount .. " enemies", COL.txt }
-        rows[2] = { "Target", (ok and t ~= nil) and "unmatched" or "none", COL.dim }
-    end
-    if perr_txt ~= "" then rows[#rows + 1] = { "PLIST", perr_txt, COL.bad } end
-    if rerr ~= "" then rows[#rows + 1] = { "ERR", rerr, COL.bad } end
-    return { title = "RESOLVER", rows = rows }
-end }
-
-HUDS[#HUDS + 1] = { name = "Shots", fn = function()
-    if not c.en then return nil end
-    local pct = ev_n.fire > 0 and floor(ev_n.hit / ev_n.fire * 100) or 0
-    local rows = {
-        { "Fire/Hit", ev_n.fire .. " / " .. ev_n.hit .. "  (" .. pct .. "%)",
-          ev_n.fire == 0 and COL.dim or (pct >= 60 and COL.ok or (pct >= 35 and COL.warn or COL.bad)) },
-        { "Miss", "res " .. ev_n.res .. " spr " .. ev_n.spr .. "(" .. ev_n.spr_res .. ") occ " .. ev_n.occ
-            .. " dth " .. ev_n.dth, COL.txt },
-    }
-    if ev_n.unm > 0 then
-        rows[#rows + 1] = { "Unmatched", tostring(ev_n.unm), COL.warn }
-        rows[#rows + 1] = { "", unm_info, COL.dim }
-    end
-    if c.dbg then
-        rows[#rows + 1] = { "why", ev_last .. "  builtin " .. (builtin_prev ~= nil and "off" or "on"), COL.dim }
-        for i = 1, #dbg_log do rows[#rows + 1] = { "", dbg_log[i], COL.dim } end
-    end
-    return { title = "SHOTS", rows = rows }
-end }
-
--- интерфейс для HC: уверенность по цели (key = slot / объект / таблица цели)
-SHARED.res_info = function(key)
-    local id = lookup(key)
-    local st = id ~= nil and states[id] or nil
-    if not st then return nil end
-    local bk = get_bucket(st, st.bkt)
-    return { conf = conf_of(st, bk), kind = st.kind, miss = st.total_miss, locked = (bk.good ~= nil) }
-end
-
-STOPS[#STOPS + 1] = function()
-    plist.reset_all()
-    builtin_restore()
-    if c.learn then save_stats() end
-end
-end -- PART 2
-
-
--- ============================================================
---  PART 3: SMART HITCHANCE (SSG 08 / Deagle) + head multipoint от уверенности резольвера
--- ============================================================
-do
-local tab  = menu.new_tab("Smart Hitchance", ICON)
-local sec  = tab:new_section("Hitchance", "Left")
-local secS = tab:new_section("SSG 08", "Right")
-local secD = tab:new_section("Deagle", "Right")
-
-local U = {}
-U.on     = T(sec, "Smart Hitchance (vs spread)", true)
-U.good   = S(sec, "HC: stand + scoped", 0, 100, 62, 0, "%")
-U.bad    = S(sec, "HC: moving / unscoped / air", 0, 100, 80, 0, "%")
-U.speed  = S(sec, "Moving above speed", 1, 30, 8, 0, " st/s")
-U.duck   = S(sec, "Crouch HC bonus", 0, 30, 8, 0, "%")
-U.hoff   = S(sec, "Head HC offset", -20, 20, 5, 0, "%")
-U.lethal = S(sec, "Lethal shot HC reduction", 0, 40, 20, 0, "%")
-U.dynmp  = T(sec, "Head MP only if resolver confident", true)
-U.mp_hc  = S(sec, "Head MP needs confidence >=", 0, 100, 30, 0, "%")
-
-local function mkprof(s, tag, good, bad)
-    local u = {}
-    u.on   = T(s, tag .. " profile", true)
-    u.good = S(s, tag .. " HC: stand + scoped", 0, 100, good, 0, "%")
-    u.bad  = S(s, tag .. " HC: moving / unscoped / air", 0, 100, bad, 0, "%")
-    u.mph  = T(s, tag .. " Multipoint head", true)
-    u.mpb  = T(s, tag .. " Multipoint body", true)
-    u.mdh  = S(s, tag .. " Min dmg head (0 = menu)", 0, 150, 0, 0, "")
-    u.mdb  = S(s, tag .. " Min dmg body (0 = menu)", 0, 150, 0, 0, "")
-    return u
-end
-local US = mkprof(secS, "SSG", 65, 82)
-local UD = mkprof(secD, "Deagle", 58, 76)
-
-local c = { on = true, good = 70, bad = 88, speed = 8, duck = 8, hoff = 5, lethal = 15,
-            dynmp = true, mp_hc = 45, ssg = {}, dg = {} }
-local HITBOXES = { "head", "chest", "pelvis", "arms", "legs" }
-local H = { cur = nil, wid = nil, pkey = nil, txt = "menu", next_t = 0, force_t = 0, box_t = 0, cfg_t = 0,
-            err = "", mph = nil, mpb = nil, head_off = false, info = nil, info_t = 0, lethal = false, mkey = nil }
-
-local function load_prof(u, d)
-    d.on   = u.on:get() and true or false
-    d.good = u.good:get()
-    d.bad  = u.bad:get()
-    d.mph  = u.mph:get() and true or false
-    d.mpb  = u.mpb:get() and true or false
-    d.mdh  = u.mdh:get()
-    d.mdb  = u.mdb:get()
-end
-local function load_cfg()
-    c.on     = U.on:get() and true or false
-    c.good   = U.good:get()
-    c.bad    = U.bad:get()
-    c.speed  = U.speed:get()
-    c.duck   = U.duck:get()
-    c.hoff   = U.hoff:get()
-    c.lethal = U.lethal:get()
-    c.dynmp  = U.dynmp:get() and true or false
-    c.mp_hc  = U.mp_hc:get()
-    load_prof(US, c.ssg)
-    load_prof(UD, c.dg)
-end
-
-local function hb_off(hb)
-    if hb == "head" then return c.hoff end
-    return 0
-end
-
-local function apply(v, boxes)
-    pcall(rage.override_hitchance, v)
-    if boxes and rage.override_hitbox_hitchance then
-        for i = 1, #HITBOXES do
-            local hb = HITBOXES[i]
-            pcall(rage.override_hitbox_hitchance, hb, clamp(v + hb_off(hb), 0, 100))
-        end
-    end
-end
-
-local function apply_prof(p, v)
-    pcall(rage.override_hitchance, v)
-    local list = { "head", "chest", "pelvis" }
-    if rage.override_hitboxes then pcall(rage.override_hitboxes, list) end
-    if rage.override_hitbox_priority then pcall(rage.override_hitbox_priority, { "head", "chest", "pelvis" }) end
-    local mph, mpb = H.mph, H.mpb
-    if mph == nil then mph = p.mph end
-    if mpb == nil then mpb = p.mpb end
-    if rage.set_hitbox_config then
-        for i = 1, #list do
-            local hb = list[i]
-            local conf = { hitchance = clamp(v + hb_off(hb), 0, 100) }
-            if hb == "head" then
-                conf.multipoint = mph
-                if p.mdh > 0 then conf.min_damage = p.mdh end
-            else
-                conf.multipoint = mpb
-                if p.mdb > 0 then conf.min_damage = p.mdb end
-            end
-            pcall(rage.set_hitbox_config, hb, conf)
-        end
-    elseif rage.override_hitbox_hitchance then
-        for i = 1, #list do
-            pcall(rage.override_hitbox_hitchance, list[i], clamp(v + hb_off(list[i]), 0, 100))
-        end
-    end
-end
-
-local function pick_prof(w)
-    local s = string.lower(tostring(w.name or "") .. " " .. tostring(w.id or ""))
-    if string.find(s, "ssg", 1, true) or string.find(s, "scout", 1, true) then
-        if c.ssg.on then return c.ssg, "SSG" end
-    elseif string.find(s, "deagle", 1, true) or string.find(s, "desert", 1, true) then
-        if c.dg.on then return c.dg, "DEAGLE" end
-    end
-    return nil, nil
-end
-
-local function compute()
-    local w = weapon.get_active()
-    if type(w) ~= "table" then return nil end
-    local prof, pname = pick_prof(w)
-    local t = 0
-    local wt = string.lower(tostring(w.type or ""))
-    if (string.find(wt, "sniper", 1, true) or pname == "SSG") and not weapon.is_scoped() then t = 1 end
-    if movement.get_speed() > c.speed then t = 1 end
-    if not movement.is_grounded() then t = 1 end
-    local good, bad = c.good, c.bad
-    if prof then good, bad = prof.good, prof.bad end
-    local v = round(good + (bad - good) * t)
-    if t < 1 and c.duck > 0 then
-        local okd, dk = pcall(movement.is_ducking)
-        if okd and dk then v = v - c.duck end
-    end
-    -- добивающий выстрел: ожидаемый урон >= HP цели -> HC можно ниже
-    H.lethal = false
-    if c.lethal > 0 then
-        local okt, tg = pcall(rage.get_target)
-        if okt and type(tg) == "table" and type(tg.damage) == "number" then
-            local pl = tg.player or tg.entity or tg.target
-            if pl ~= nil then
-                local okh, hp = pcall(entity.get_player_health, pl)
-                if okh and type(hp) == "number" and hp > 0 and tg.damage >= hp then
-                    v = v - c.lethal
-                    H.lethal = true
-                end
-            end
-        end
-    end
-    return clamp(v, 0, 100), t, w, prof, pname
-end
-
--- multipoint головы выключаем, пока резольвер не уверен в цели (гистерезис 5%)
-local function calc_mp(prof, rt)
-    local mph, mpb = prof.mph, prof.mpb
-    if c.dynmp then
-        local conf = 0.7
-        local okt, tg = pcall(rage.get_target)
-        if okt and type(tg) == "table" and SHARED.res_info then
-            local oki, info = pcall(SHARED.res_info, tg)
-            if oki and type(info) == "table" then H.info, H.info_t = info, rt end
-        end
-        if H.info and (rt - H.info_t) < 1.5 then conf = H.info.conf end
-        local thr = c.mp_hc / 100
-        if H.head_off then
-            if conf >= thr + 0.05 then H.head_off = false end
-        elseif conf < thr then
-            H.head_off = true
-        end
-        if H.head_off then mph = false end
-    else
-        H.head_off = false
-    end
-    return mph, mpb
-end
-
-local function hc_tick()
-    local rt = clock()
-    if rt >= H.cfg_t then load_cfg(); H.cfg_t = rt + 0.25 end
-    if rt < H.next_t then return end
-    H.next_t = rt + 0.05
-
-    if not c.on then
-        if H.cur ~= nil then pcall(rage.reset); H.cur, H.wid, H.pkey, H.txt, H.v = nil, nil, nil, "menu", nil end
-        return
-    end
-    if not ME.alive then return end
-
-    local ok, v, t, w, prof, pname = pcall(compute)
-    if not ok then H.txt = "err"; H.err = string.sub(tostring(v), -80) return end
-    if v == nil then H.txt, H.v = "no weapon", nil return end
-    H.err = ""
-
-    local pkey = pname or "-"
-    if pkey ~= H.pkey then
-        if H.pkey ~= nil and H.pkey ~= "-" then pcall(rage.reset) end
-        H.pkey, H.cur, H.wid, H.mkey, H.head_off = pkey, nil, nil, nil, false
-    end
-
-    local mchanged = false
-    if prof then
-        local mph, mpb = calc_mp(prof, rt)
-        local mkey = tostring(mph) .. tostring(mpb)
-        if mkey ~= H.mkey then mchanged = true; H.mkey = mkey; H.mph, H.mpb = mph, mpb end
-    end
-
-    local wid = w.id or w.name
-    local changed = (v ~= H.cur) or (wid ~= H.wid) or mchanged
-    if changed or rt >= H.force_t then
-        H.cur, H.wid, H.force_t = v, wid, rt + 1
-        local boxes = changed or rt >= H.box_t
-        if boxes then H.box_t = rt + 3 end
-        if prof then
-            if boxes then apply_prof(prof, v) else pcall(rage.override_hitchance, v) end
-        else
-            apply(v, boxes)
-        end
-    end
-    H.v, H.tq, H.pname = v, t, pname
-    H.txt = "want " .. v .. (t >= 1 and " (bad)" or " (good)")
-        .. (H.lethal and " | LETHAL" or "")
-        .. (pname and (" | " .. pname .. " MP " .. (H.mph and "H" or "-") .. (H.mpb and "B" or "-")) or "")
-end
-
-TICKS[#TICKS + 1] = function()
-    local ok, e = pcall(hc_tick)
-    if not ok then H.err = string.sub(tostring(e), -80) end
-end
-
-HUDS[#HUDS + 1] = { name = "Hitchance", fn = function()
-    if not c.on then return nil end
-    local rows = {}
-    if H.v then
-        local bad = (H.tq or 0) >= 1
-        rows[1] = { "Hitchance", H.v .. "%  " .. (bad and "moving/unscoped" or "stable"), bad and COL.warn or COL.ok }
-        rows[2] = { "Profile", (H.pname or "default") .. "  MP "
-            .. (H.pname and ((H.mph and "H" or "-") .. (H.mpb and "B" or "-")) or "menu")
-            .. (H.lethal and "  LETHAL" or ""), H.lethal and COL.ok or COL.txt }
-    else
-        rows[1] = { "Hitchance", H.txt, COL.dim }
-    end
-    if H.err ~= "" then rows[#rows + 1] = { "ERR", H.err, COL.bad } end
-    return { title = "HITCHANCE", rows = rows }
-end }
-
-STOPS[#STOPS + 1] = function() if H.cur ~= nil then pcall(rage.reset) end end
-end -- PART 3
-
-
--- ============================================================
---  PART 4: HUD-панель (Drawing) + единый on_tick
---  Объекты в пуле, перерисовка только при изменении данных (опрос 6-7 Гц), без аллокаций в paint.
--- ============================================================
-do
-local tab = menu.new_tab("HVH HUD", ICON)
-local sec = tab:new_section("HUD", "Left")
-
-local U = {}
-U.master = sec:new_toggle("Show HUD", true)
-local show = {}
-for i = 1, #HUDS do show[i] = sec:new_toggle("Show: " .. HUDS[i].name, true) end
-U.x     = sec:new_slider("HUD X", 0, 1920, 20, 0, "px")
-U.y     = sec:new_slider("HUD Y", 0, 1080, 300, 0, "px")
-U.size  = sec:new_slider("HUD Size", 10, 20, 12, 0, "px")
-U.alpha = sec:new_slider("HUD Opacity", 30, 100, 88, 0, "%")
-sec:new_button("Apply Recommended Settings", function()
-    for i = 1, #PRESET do
-        local p = PRESET[i]
-        pcall(function() p.el:set(p.def, true) end)
-    end
-end)
-
-local FONT = (Drawing.Fonts and Drawing.Fonts.Plex) or 2
-local C_BG, C_LINE, C_TRACK, C_BORDER = color(13, 15, 23), color(38, 43, 62), color(34, 38, 54), color(52, 58, 84)
-local C_G1, C_G2 = color(66, 88, 232), color(132, 72, 220)
-
--- постоянные объекты: фон, шапка, индикатор статуса
-local bg, hdr, dot = Drawing.new("Square"), Drawing.new("Square"), Drawing.new("Circle")
+for name, handle in pairs(config_controls) do
+if values[name] ~= nil then
 pcall(function()
-    bg.Filled, hdr.Filled, dot.Filled = true, true, true
-    bg.ZIndex, hdr.ZIndex, dot.ZIndex = 10, 11, 14
-    dot.Radius = 4
+handle:set(values[name])
 end)
-bg.Visible, hdr.Visible, dot.Visible = false, false, false
-
--- пул текстов и прямоугольников (бары, разделители, метки секций)
-local TXT, SQR = {}, {}
-local nt, nq = 0, 0
-
-local function T()
-    nt = nt + 1
-    local o = TXT[nt]
-    if not o then
-        o = Drawing.new("Text")
-        pcall(function() o.Font = FONT; o.Outline = false; o.ZIndex = 13 end)
-        TXT[nt] = o
-    end
-    o.Visible = true
-    return o
+end
 end
 
-local function Q()
-    nq = nq + 1
-    local o = SQR[nq]
-    if not o then
-        o = Drawing.new("Square")
-        pcall(function() o.Filled = true; o.ZIndex = 12 end)
-        SQR[nq] = o
-    end
-    o.Visible = true
-    return o
+update_menu_visibility()
+return true
 end
 
-local function settx(o, str, x, y, size, col)
-    o.Text, o.Size, o.Position, o.Color = str, size, vector(x, y), col
+local function collect_config_values()
+local values = {}
+for name, handle in pairs(config_controls) do
+values[name] = handle:get()
 end
 
-local function setsq(o, x, y, w, h, col, a, rnd)
-    o.Position, o.Size, o.Color = vector(x, y), vector(w, h), col
-    o.Transparency, o.Rounding = a, rnd
+values.config_version = CONFIG_VERSION
+values.config_format = "blessed.lua"
+
+return values
 end
 
-local function tw(str, size)                          -- ширина текста (фолбэк - эвристика)
-    local ok, v = pcall(render.measure_text, str, size, FONT)
-    if ok and v ~= nil then
-        local w = v.X
-        if type(w) == "number" then return w end
-    end
-    return #str * size * 0.56
+local function save_config()
+local values = collect_config_values()
+
+pcall(function()
+database.write(DB_KEY, values)
+database.flush()
+end)
 end
 
-local function layout(secs, x, y, sz, alpha, alive)
-    nt, nq = 0, 0
-    local pad  = round(sz * 0.8)
-    local rowh = sz + 5
-    local labw = round(sz * 5.8)
-    local W    = round(sz * 26)
-    local hh   = sz + 16
-    local lx0  = x + pad + 9
-    local vw   = W - pad * 2 - 9 - labw
-    local maxc = max(8, floor(vw / (sz * 0.56)))
-    local barw = floor(vw * 0.55)
+local function load_config()
+local values = call_or(nil, database.read, DB_KEY)
 
-    -- шапка: градиент + название + статус
-    setsq(hdr, x, y, W, hh, C_G1, alpha, 8)
-    hdr.Visible = true
-    pcall(function() hdr.Gradient = { Color1 = C_G1, Color2 = C_G2, Angle = 0 } end)
-    local ty = y + floor((hh - sz) / 2) - 1
-    local title = T(); settx(title, "HVH LITE", x + pad, ty, sz + 1, COL.txt)
-    local ver = T();   settx(ver, "v9.1", x + pad + tw("HVH LITE", sz + 1) + 6, ty + 1, sz - 1, color(230, 234, 255))
-    local stxt = alive and "ALIVE" or "DEAD"
-    local st = T();    settx(st, stxt, x + W - pad - 13 - tw(stxt, sz - 1), ty + 1, sz - 1, COL.txt)
-    dot.Position, dot.Color, dot.Visible = vector(x + W - pad - 4, y + floor(hh / 2)), alive and COL.ok or COL.bad, true
-
-    -- секции
-    local cy = y + hh + 8
-    for si = 1, #secs do
-        local s = secs[si]
-        if si > 1 then
-            setsq(Q(), x + pad, cy - 3, W - pad * 2, 1, C_LINE, 1, 0)
-            cy = cy + 3
-        end
-        setsq(Q(), x + pad, cy + 2, 3, sz - 3, COL.acc, 1, 1)
-        settx(T(), s.title, x + pad + 9, cy, sz - 1, COL.dim)
-        cy = cy + rowh
-
-        local rows = s.rows
-        for ri = 1, #rows do
-            local r = rows[ri]
-            local lbl, val, col, bar = r[1], tostring(r[2] or ""), r[3] or COL.txt, r[4]
-            local vx = lx0 + labw
-            if lbl and lbl ~= "" then settx(T(), lbl, lx0, cy, sz, COL.dim) end
-            if bar then
-                local by = cy + floor(sz / 2) - 1
-                setsq(Q(), vx, by, barw, 5, C_TRACK, 1, 2)
-                setsq(Q(), vx, by, max(3, floor(barw * clamp(bar, 0, 1))), 5, col, 1, 2)
-                settx(T(), val, vx + barw + 6, cy, sz, col)
-                cy = cy + rowh
-            else
-                local rest = val
-                repeat                                  -- длинное значение переносим по пробелам
-                    local cut = maxc
-                    if #rest > maxc then
-                        for k = maxc, floor(maxc * 0.5), -1 do
-                            if string.byte(rest, k) == 32 then cut = k; break end
-                        end
-                    else
-                        cut = #rest
-                    end
-                    settx(T(), string.sub(rest, 1, cut), vx, cy, sz, col)
-                    cy = cy + rowh
-                    rest = string.gsub(string.sub(rest, cut + 1), "^%s+", "")
-                until rest == ""
-            end
-        end
-        cy = cy + 3
-    end
-
-    -- фон под всё
-    setsq(bg, x, y, W, cy - y + 2, C_BG, alpha, 8)
-    bg.Visible = true
-    pcall(function() bg.BorderColor = C_BORDER end)
-
-    for i = nt + 1, #TXT do TXT[i].Visible = false end
-    for i = nq + 1, #SQR do SQR[i].Visible = false end
+if type(values) ~= "table" then
+apply_config_values(DEFAULT_PRESET)
+save_config()
+return
 end
 
-local h_next, h_sig, h_vis, h_err = 0, "", false, false
-local function hide_all()
-    if not h_vis then return end
-    h_vis, h_sig = false, ""
-    bg.Visible, hdr.Visible, dot.Visible = false, false, false
-    for i = 1, #TXT do TXT[i].Visible = false end
-    for i = 1, #SQR do SQR[i].Visible = false end
+if values.config_version ~= CONFIG_VERSION then
+apply_config_values(DEFAULT_PRESET)
+save_config()
+return
 end
+
+apply_config_values(values)
+end
+
+local target_misses = {}
+local resolver_targets = {}
+local pending_shots = {}
+local resolver_overrides_applied = false
+
+resolver_section:new_button("Reset resolver state", function()
+pcall(rage.reset_resolver_state)
+pcall(plist.reset_all)
+target_misses = {}
+resolver_targets = {}
+pending_shots = {}
+resolver_overrides_applied = false
+end)
+
+local function target_key(target)
+return tostring(target or "unknown")
+end
+
+local function get_target_slot(target)
+if target == nil then
+return nil
+end
+
+if type(entity.get_player_slot) == "function" then
+local slot = call_or(nil, entity.get_player_slot, target)
+if slot ~= nil then
+return slot
+end
+end
+
+local info = call_or(nil, entity.get_info, target)
+if info ~= nil and info.slot ~= nil then
+return info.slot
+end
+
+return target
+end
+
+local function get_resolver_target_state(target)
+local slot = get_target_slot(target)
+local key = target_key(slot)
+local state = resolver_targets[key]
+
+if state == nil then
+state = {
+slot = slot,
+misses = 0,
+hits = 0,
+stage = 0,
+locked_yaw = nil,
+freestand = nil,
+lock_applied = false
+}
+resolver_targets[key] = state
+end
+
+return state
+end
+
+local function normalized_angle(value)
+return ((tonumber(value) or 0) + 180) % 360 - 180
+end
+
+local function detect_enemy_freestand(target)
+local anim = call_or(nil, entity.get_anim_state, target)
+if anim == nil then
+return "center"
+end
+
+local eye = tonumber(anim.eye_angles_y)
+local feet = tonumber(anim.goal_feet_yaw)
+if eye == nil or feet == nil then
+return "center"
+end
+
+local delta = normalized_angle(feet - eye)
+if delta > 10 then
+return "left"
+elseif delta < -10 then
+return "right"
+end
+return "center"
+end
+
+local toolkit_active = false
+local aa_runtime_active = false
+local rage_runtime_active = false
+local resolver_runtime_active = false
+local auto_scope_applied = false
+local current_state = "Unknown"
+local current_weapon = "None"
+local current_scoped = false
+local current_speed = 0
+local current_in_air = false
+local current_crouching = false
+local current_state_override = false
+local current_state_override_mode = "None"
+local state_override_was_active = false
+local state_spin_started_at = 0
+local state_spin_speed_runtime = 720
+local state_spin_direction_runtime = 1
+local madness_step_runtime = 0
+local madness_visual = {
+neck_pitch = 0,
+neck_yaw = 0,
+neck_roll = 0,
+waist_pitch = 0,
+waist_yaw = 0,
+waist_roll = 0,
+left_shoulder_pitch = 0,
+left_shoulder_yaw = 0,
+left_shoulder_roll = 0,
+right_shoulder_pitch = 0,
+right_shoulder_yaw = 0,
+right_shoulder_roll = 0
+}
+local madness_character = nil
+local madness_neck = nil
+local madness_waist = nil
+local madness_left_shoulder = nil
+local madness_right_shoulder = nil
+local madness_body_applied = false
+local sway_amount = 0
+local explicit_desync_active = false
+local movement_choke_active = false
+local movement_choke_started = 0
+local auto_duck_applied = false
+local manual_yaw = nil
+local flick_runtime = {
+state = "REST",
+timer = 0,
+toggle_active = false,
+previous_key = false,
+active = false
+}
+
+local YAW_BASES = {
+Backward = 180,
+Forward = 0,
+Left = -90,
+Right = 90
+}
+
+local HITBOX_PRESETS = {
+Head = { "head" },
+["Head + chest"] = { "head", "chest" },
+Body = { "chest", "pelvis" },
+All = { "head", "chest", "pelvis", "arms", "legs" }
+}
+
+local HITBOX_PRIORITIES = {
+Head = { "head" },
+["Head + chest"] = { "head", "chest" },
+Body = { "pelvis", "chest" },
+All = { "head", "chest", "pelvis" }
+}
+
+local function sway_modifier(tick)
+return math.sin(tick * 0.18) * sway_amount
+end
+
+local function state_spin_modifier()
+local elapsed = globals.realtime() - state_spin_started_at
+local angle = elapsed * state_spin_speed_runtime * state_spin_direction_runtime
+return (angle + 180) % 360 - 180
+end
+
+local function get_state_group()
+local state = string.lower(tostring(current_state or ""))
+
+if current_in_air
+or string.find(state, "jump", 1, true) ~= nil
+or string.find(state, "air", 1, true) ~= nil
+then
+return "air"
+end
+
+if current_crouching
+or string.find(state, "duck", 1, true) ~= nil
+or string.find(state, "crouch", 1, true) ~= nil
+then
+return "duck"
+end
+
+if string.find(state, "run", 1, true) ~= nil
+or string.find(state, "move", 1, true) ~= nil
+or string.find(state, "walk", 1, true) ~= nil
+or current_speed > 5
+then
+return "run"
+end
+
+if state == "unknown" or state == "" then
+return nil
+end
+
+return "stand"
+end
+
+local function should_use_state_override()
+if not state_override_enabled:get() then
+return false
+end
+
+local group = get_state_group()
+if group == "air" then
+return state_on_air:get()
+elseif group == "duck" then
+return state_on_duck:get()
+elseif group == "run" then
+return state_on_run:get()
+elseif group == "stand" then
+return state_on_stand:get()
+end
+
+return false
+end
+
+local function deterministic_unit(step)
+local value = (step * 1103515245 + 12345) % 2147483648
+return (value % 100001) / 100000
+end
+
+local function deterministic_between(step, value_a, value_b)
+local minimum = math.min(value_a, value_b)
+local maximum = math.max(value_a, value_b)
+return minimum + (maximum - minimum) * deterministic_unit(step)
+end
+
+local function find_character_motor(character, name)
+if character == nil then
+return nil
+end
+
+local motor = character:FindFirstChild(name, true)
+if motor ~= nil and motor:IsA("Motor6D") then
+return motor
+end
+return nil
+end
+
+local function restore_madness_body()
+if madness_body_applied then
+if madness_neck ~= nil and madness_neck.Parent ~= nil then
+madness_neck.Transform = CFrame.new()
+end
+if madness_waist ~= nil and madness_waist.Parent ~= nil then
+madness_waist.Transform = CFrame.new()
+end
+if madness_left_shoulder ~= nil and madness_left_shoulder.Parent ~= nil then
+madness_left_shoulder.Transform = CFrame.new()
+end
+if madness_right_shoulder ~= nil and madness_right_shoulder.Parent ~= nil then
+madness_right_shoulder.Transform = CFrame.new()
+end
+end
+madness_body_applied = false
+end
+
+local function refresh_madness_character()
+local player = call_or(nil, entity.get_local_player)
+local character = player and player.Character or nil
+
+if character ~= madness_character then
+restore_madness_body()
+madness_character = character
+madness_neck = find_character_motor(character, "Neck")
+madness_waist = find_character_motor(character, "Waist")
+madness_left_shoulder = find_character_motor(character, "LeftShoulder")
+or find_character_motor(character, "Left Shoulder")
+madness_right_shoulder = find_character_motor(character, "RightShoulder")
+or find_character_motor(character, "Right Shoulder")
+else
+if madness_neck == nil then
+madness_neck = find_character_motor(character, "Neck")
+end
+if madness_waist == nil then
+madness_waist = find_character_motor(character, "Waist")
+end
+if madness_left_shoulder == nil then
+madness_left_shoulder = find_character_motor(character, "LeftShoulder")
+or find_character_motor(character, "Left Shoulder")
+end
+if madness_right_shoulder == nil then
+madness_right_shoulder = find_character_motor(character, "RightShoulder")
+or find_character_motor(character, "Right Shoulder")
+end
+end
+end
+
+local function update_madness_visual(step)
+local strength = clamp(state_body_chaos_strength:get(), 0, 89)
+madness_visual.neck_pitch = deterministic_between(step + 101, -strength, strength)
+madness_visual.neck_yaw = deterministic_between(step + 211, -strength, strength)
+madness_visual.neck_roll = deterministic_between(step + 307, -strength * 0.75, strength * 0.75)
+madness_visual.waist_pitch = deterministic_between(step + 401, -strength * 0.45, strength * 0.45)
+madness_visual.waist_yaw = deterministic_between(step + 503, -strength * 0.55, strength * 0.55)
+madness_visual.waist_roll = deterministic_between(step + 607, -strength * 0.35, strength * 0.35)
+madness_visual.left_shoulder_pitch = deterministic_between(step + 701, -strength, strength)
+madness_visual.left_shoulder_yaw = deterministic_between(step + 809, -strength * 0.7, strength * 0.7)
+madness_visual.left_shoulder_roll = deterministic_between(step + 907, -strength, strength)
+madness_visual.right_shoulder_pitch = deterministic_between(step + 1009, -strength, strength)
+madness_visual.right_shoulder_yaw = deterministic_between(step + 1103, -strength * 0.7, strength * 0.7)
+madness_visual.right_shoulder_roll = deterministic_between(step + 1201, -strength, strength)
+end
+
+local function render_madness_body()
+local active = master:get()
+and aa_enabled:get()
+and current_state_override
+and current_state_override_mode == "Madness"
+and state_upper_body_chaos:get()
+
+if not active then
+restore_madness_body()
+return
+end
+
+refresh_madness_character()
+local applied = false
+
+if madness_neck ~= nil and madness_neck.Parent ~= nil then
+madness_neck.Transform = CFrame.Angles(
+math.rad(madness_visual.neck_pitch),
+math.rad(madness_visual.neck_yaw),
+math.rad(madness_visual.neck_roll)
+)
+applied = true
+end
+
+if madness_waist ~= nil and madness_waist.Parent ~= nil then
+madness_waist.Transform = CFrame.Angles(
+math.rad(madness_visual.waist_pitch),
+math.rad(madness_visual.waist_yaw),
+math.rad(madness_visual.waist_roll)
+)
+applied = true
+end
+
+if madness_left_shoulder ~= nil and madness_left_shoulder.Parent ~= nil then
+madness_left_shoulder.Transform = CFrame.Angles(
+math.rad(madness_visual.left_shoulder_pitch),
+math.rad(madness_visual.left_shoulder_yaw),
+math.rad(madness_visual.left_shoulder_roll)
+)
+applied = true
+end
+
+if madness_right_shoulder ~= nil and madness_right_shoulder.Parent ~= nil then
+madness_right_shoulder.Transform = CFrame.Angles(
+math.rad(madness_visual.right_shoulder_pitch),
+math.rad(madness_visual.right_shoulder_yaw),
+math.rad(madness_visual.right_shoulder_roll)
+)
+applied = true
+end
+
+madness_body_applied = applied
+end
+
+local function resolve_mega_token(token, pitch_a, pitch_b, step)
+if type(token) == "number" then
+return clamp(token, -89, 89)
+elseif token == "A" then
+return pitch_a
+elseif token == "B" then
+return pitch_b
+elseif token == "-A" then
+return clamp(-pitch_a, -89, 89)
+elseif token == "-B" then
+return clamp(-pitch_b, -89, 89)
+elseif token == "R" or token == "RANDOM" then
+return deterministic_between(step, pitch_a, pitch_b)
+end
+
+return 0
+end
+
+local function get_pitch_override(tick)
+local selected_pitch = pitch_mode:get()
+if selected_pitch == "Custom" then
+return clamp(custom_pitch:get(), -89, 89)
+end
+
+if selected_pitch ~= "Jitter" and selected_pitch ~= "Mega" then
+return selected_pitch
+end
+
+local pitch_a = clamp(pitch_jitter_a:get(), -89, 89)
+local pitch_b = clamp(pitch_jitter_b:get(), -89, 89)
+local interval = math.max(1, math.floor(pitch_jitter_speed:get()))
+local step = math.floor(tick / interval)
+
+if selected_pitch == "Jitter" then
+local pattern = pitch_jitter_pattern:get()
+
+if pattern == "3-Way" then
+local center = clamp(pitch_jitter_center:get(), -89, 89)
+local stage = step % 4
+if stage == 0 then
+return pitch_a
+elseif stage == 1 or stage == 3 then
+return center
+end
+return pitch_b
+elseif pattern == "Random" then
+return deterministic_between(step, pitch_a, pitch_b)
+elseif pattern == "Sway" then
+local midpoint = (pitch_a + pitch_b) * 0.5
+local amplitude = (pitch_b - pitch_a) * 0.5
+return clamp(midpoint + math.sin(tick * (0.18 / interval)) * amplitude, -89, 89)
+end
+
+return step % 2 == 0 and pitch_a or pitch_b
+end
+
+local token = sample_timed_sequence(mega_sequence_data, step)
+return resolve_mega_token(token, pitch_a, pitch_b, step)
+end
+
+local function apply_configured_yaw_pattern(tick, base_offset)
+local modifier = yaw_modifier:get()
+local amount = clamp(modifier_amount:get(), 0, 180)
+local period = math.max(1, math.floor(yaw_pattern_period:get()))
+local step = math.floor(tick / period)
+
+if modifier == "Disabled" then
+aa.override_yaw_offset(base_offset)
+aa.override_yaw_modifier("Disabled", 0)
+elseif modifier == "Center" or modifier == "3-Way" or modifier == "5-Way" then
+aa.override_yaw_offset(base_offset)
+aa.override_yaw_modifier(modifier, amount)
+elseif modifier == "Sway" then
+aa.override_yaw_offset(base_offset)
+sway_amount = amount
+aa.override_yaw_modifier(sway_modifier)
+else
+local custom = 0
+
+if modifier == "Asymmetric" then
+local left_hold = math.max(1, math.floor(yaw_asymmetric_left_hold:get()))
+local right_hold = math.max(1, math.floor(yaw_asymmetric_right_hold:get()))
+local phase = step % (left_hold + right_hold)
+custom = phase < left_hold
+and clamp(yaw_asymmetric_left:get(), -180, 180)
+or clamp(yaw_asymmetric_right:get(), -180, 180)
+elseif modifier == "Random" then
+custom = deterministic_between(step, -amount, amount)
+elseif modifier == "Sequence" then
+custom = sample_timed_sequence(yaw_sequence_data, step)
+elseif modifier == "Spin" then
+local seconds = tick * call_or(1 / 64, globals.tickinterval)
+custom = normalized_angle(seconds * clamp(yaw_spin_speed:get(), -720, 720))
+elseif modifier == "Sine" then
+local wave = math.max(2, math.floor(yaw_wave_period:get()))
+custom = math.sin(tick * 2 * math.pi / wave) * amount
+elseif modifier == "Triangle" then
+local wave = math.max(2, math.floor(yaw_wave_period:get()))
+custom = (1 - 4 * math.abs((tick / wave) % 1 - 0.5)) * amount
+end
+
+aa.override_yaw_modifier("Disabled", 0)
+aa.override_yaw_offset(normalized_angle(base_offset + custom))
+end
+end
+
+local function update_manual_direction()
+manual_yaw = nil
+if not manual_direction_enabled:get() then
+return
+end
+
+if manual_left:get() then
+manual_yaw = 90
+elseif manual_right:get() then
+manual_yaw = -90
+elseif manual_back:get() then
+manual_yaw = 180
+elseif manual_forward:get() then
+manual_yaw = 0
+end
+end
+
+local function update_flick_runtime()
+local key_down = flick_bind:get() == true
+local toggle_mode = flick_bind_mode:get() == "Toggle"
+
+if not flick_enabled:get() then
+flick_runtime.state = "REST"
+flick_runtime.timer = 0
+flick_runtime.toggle_active = false
+flick_runtime.previous_key = key_down
+flick_runtime.active = false
+return false
+end
+
+if toggle_mode and key_down and not flick_runtime.previous_key then
+flick_runtime.toggle_active = not flick_runtime.toggle_active
+end
+flick_runtime.previous_key = key_down
+
+local running = (not toggle_mode and key_down) or (toggle_mode and flick_runtime.toggle_active)
+
+if not running then
+flick_runtime.state = "REST"
+flick_runtime.timer = 0
+flick_runtime.active = false
+if not toggle_mode then
+flick_runtime.toggle_active = false
+end
+return false
+end
+
+flick_runtime.timer = flick_runtime.timer + 1
+flick_runtime.active = flick_runtime.state == "FLICK"
+
+if flick_runtime.state == "REST" then
+if flick_runtime.timer >= math.max(1, math.floor(flick_rest_ticks:get())) then
+flick_runtime.state = "FLICK"
+flick_runtime.timer = 0
+flick_runtime.active = true
+end
+elseif flick_runtime.timer >= math.max(1, math.floor(flick_ticks:get())) then
+flick_runtime.state = "REST"
+flick_runtime.timer = 0
+flick_runtime.active = false
+end
+
+return flick_runtime.active
+end
+
+local function compute_desync_values(tick, inverted)
+local mode = desync_pattern:get()
+local static_limit = clamp(desync_limit:get(), 0, 86)
+if mode == "Static" then
+return static_limit, static_limit, false, 0, 0
+end
+
+local left_min = clamp(desync_left_min:get(), 0, 86)
+local left_max = clamp(desync_left_max:get(), 0, 86)
+local right_min = clamp(desync_right_min:get(), 0, 86)
+local right_max = clamp(desync_right_max:get(), 0, 86)
+local period = math.max(1, math.floor(desync_pattern_period:get()))
+local step = math.floor(tick / period)
+
+if mode == "Explicit" then
+local real = clamp(desync_real:get(), -86, 86)
+local fake = clamp(desync_fake:get(), -86, 86)
+if desync_mirror_explicit:get() and inverted then
+real = -real
+fake = -fake
+end
+return left_max, right_max, true, real, fake
+elseif mode == "Alternating" then
+if step % 2 == 0 then
+return left_max, right_min, false, 0, 0
+end
+return left_min, right_max, false, 0, 0
+elseif mode == "Random" then
+return deterministic_between(step, left_min, left_max),
+deterministic_between(step + 79, right_min, right_max),
+false,
+0,
+0
+elseif mode == "Sine" then
+local wave = (math.sin(tick * 2 * math.pi / period) + 1) * 0.5
+return left_min + (left_max - left_min) * wave,
+right_min + (right_max - right_min) * (1 - wave),
+false,
+0,
+0
+elseif mode == "Sequence" then
+local value = clamp(sample_timed_sequence(desync_sequence_data, step), 0, 86)
+return math.min(value, left_max), math.min(value, right_max), false, 0, 0
+end
+
+return static_limit, static_limit, false, 0, 0
+end
+
+local function compute_fake_lag_limit(tick)
+local mode = fake_lag_pattern:get()
+local maximum = clamp(fake_lag_limit:get(), 0, 14)
+if mode == "Static" then
+return math.floor(maximum)
+end
+
+local minimum = clamp(fake_lag_min:get(), 0, 14)
+local period = math.max(1, math.floor(fake_lag_pattern_period:get()))
+local step = math.floor(tick / period)
+local value = maximum
+
+if mode == "Alternating" then
+value = step % 2 == 0 and minimum or maximum
+elseif mode == "Random" then
+value = deterministic_between(step + 313, minimum, maximum)
+elseif mode == "Sine" then
+value = minimum + (maximum - minimum) * (math.sin(tick * 2 * math.pi / period) + 1) * 0.5
+elseif mode == "Sequence" then
+value = sample_timed_sequence(fake_lag_sequence_data, step)
+end
+
+return math.floor(clamp(value, 0, 14) + 0.5)
+end
+
+local function update_local_snapshot()
+local local_player = call_or(nil, entity.get_local_player)
+local info = local_player and call_or(nil, entity.get_info, local_player) or nil
+local weapon = call_or(nil, client.get_weapon)
+
+current_scoped = weapon ~= nil and weapon.is_scoped == true
+
+if info ~= nil then
+current_state = tostring(info.state or "Unknown")
+current_weapon = tostring(info.weapon_name or (weapon and (weapon.name or weapon.id)) or "None")
+current_speed = tonumber(info.speed) or 0
+current_in_air = info.is_in_air == true
+current_crouching = info.is_crouching == true
+else
+current_state = "Unknown"
+current_weapon = weapon and tostring(weapon.name or weapon.id or "None") or "None"
+current_speed = 0
+current_in_air = false
+current_crouching = false
+end
+end
+
+local function is_sniper_weapon()
+local weapon = call_or(nil, client.get_weapon)
+if weapon == nil then
+return false
+end
+
+local weapon_type = string.lower(tostring(weapon.type or ""))
+local weapon_name = string.lower(tostring(weapon.name or weapon.id or ""))
+
+return string.find(weapon_type, "sniper", 1, true) ~= nil
+or string.find(weapon_name, "scout", 1, true) ~= nil
+or string.find(weapon_name, "ssg", 1, true) ~= nil
+or string.find(weapon_name, "awp", 1, true) ~= nil
+or string.find(weapon_name, "auto sniper", 1, true) ~= nil
+end
+
+local function apply_anti_aim(tick)
+local wants_explicit_desync = desync_enabled:get() and desync_pattern:get() == "Explicit"
+if explicit_desync_active and not wants_explicit_desync then
+aa.reset()
+end
+
+aa_runtime_active = true
+
+local state_active = should_use_state_override()
+current_state_override = state_active
+
+if state_active then
+local selected_state_mode = state_override_mode:get()
+local mode_changed = current_state_override_mode ~= selected_state_mode
+if not state_override_was_active or mode_changed then
+state_spin_started_at = globals.realtime()
+if state_disable_fake_lag:get() then
+aa.unchoke()
+end
+end
+current_state_override_mode = selected_state_mode
+
+if selected_state_mode == "Madness" then
+local period = math.max(1, math.floor(state_madness_period:get()))
+local step = math.floor(tick / period)
+madness_step_runtime = step
+
+local pitch = deterministic_between(
+step + 17,
+clamp(state_madness_pitch_min:get(), -89, 89),
+clamp(state_madness_pitch_max:get(), -89, 89)
+)
+local yaw_range = clamp(state_madness_yaw_range:get(), 0, 180)
+local yaw = deterministic_between(step + 43, -yaw_range, yaw_range)
+local offset = deterministic_between(step + 79, -180, 180)
+
+aa.override_pitch(pitch)
+aa.override_yaw(yaw, "camera")
+aa.override_yaw_offset(offset)
+aa.override_yaw_modifier("Disabled", 0)
+update_madness_visual(step)
+else
+state_spin_speed_runtime = clamp(state_spin_speed:get(), 30, 1440)
+state_spin_direction_runtime = state_spin_direction:get() == "Left" and -1 or 1
+
+aa.override_pitch(clamp(state_pitch:get(), -89, 89))
+aa.override_yaw(YAW_BASES[state_yaw_base:get()] or 180, "camera")
+aa.override_yaw_offset(clamp(state_yaw_offset:get(), -180, 180))
+aa.override_yaw_modifier(state_spin_modifier)
+end
+else
+current_state_override_mode = "None"
+aa.override_pitch(get_pitch_override(tick))
+aa.override_yaw(YAW_BASES[yaw_base:get()] or 180, "camera")
+
+local amount = clamp(modifier_amount:get(), 0, 180)
+if adaptive_aa:get() then
+aa.override_yaw_offset(clamp(yaw_offset:get(), -180, 180))
+if current_state == "Jumping" then
+aa.override_yaw_modifier("Spin", amount)
+elseif current_state == "Duck" then
+aa.override_yaw_modifier("5-Way", amount)
+elseif current_state == "Run" then
+aa.override_yaw_modifier("3-Way", amount)
+else
+aa.override_yaw_modifier("Center", amount)
+end
+else
+apply_configured_yaw_pattern(tick, clamp(yaw_offset:get(), -180, 180))
+end
+end
+
+update_manual_direction()
+if manual_yaw ~= nil then
+aa.override_yaw(manual_yaw, "camera")
+aa.override_yaw_modifier("Disabled", 0)
+end
+
+if update_flick_runtime() then
+aa.override_yaw(clamp(flick_yaw:get(), -180, 180), "camera")
+aa.override_pitch(clamp(flick_pitch:get(), -89, 89))
+end
+
+state_override_was_active = state_active
+
+local body_enabled = desync_enabled:get()
+aa.override_body_yaw(body_enabled)
+if body_enabled then
+local madness_desync = state_active
+and current_state_override_mode == "Madness"
+and state_madness_desync:get()
+local inverted = inverter_key:get()
+if madness_desync then
+inverted = deterministic_unit(madness_step_runtime + 907) >= 0.5
+elseif auto_invert:get() then
+local interval = math.max(1, math.floor(invert_interval:get()))
+inverted = math.floor(tick / interval) % 2 == 1
+end
+
+aa.override_inverter(inverted)
+local left, right, explicit, real, fake
+if madness_desync then
+left = deterministic_between(madness_step_runtime + 1009, 0, 86)
+right = deterministic_between(madness_step_runtime + 1201, 0, 86)
+explicit = false
+real = 0
+fake = 0
+else
+left, right, explicit, real, fake = compute_desync_values(tick, inverted)
+end
+aa.override_desync_limits(left, right)
+if explicit then
+aa.override_desync(real, fake)
+end
+explicit_desync_active = explicit
+aa.override_show_fake(show_fake:get())
+else
+explicit_desync_active = false
+aa.override_show_fake(false)
+end
+
+local lag_enabled = fake_lag_enabled:get()
+if state_active and state_disable_fake_lag:get() then
+lag_enabled = false
+end
+
+aa.override_fake_lag(lag_enabled)
+if lag_enabled then
+aa.override_fake_lag_limit(compute_fake_lag_limit(tick))
+aa.override_fake_lag_variability(clamp(fake_lag_variability:get(), 0, 100))
+end
+end
+
+local function reset_anti_aim()
+if aa_runtime_active then
+aa.reset()
+aa_runtime_active = false
+end
+
+current_state_override = false
+current_state_override_mode = "None"
+state_override_was_active = false
+restore_madness_body()
+explicit_desync_active = false
+manual_yaw = nil
+flick_runtime.state = "REST"
+flick_runtime.timer = 0
+flick_runtime.active = false
+flick_runtime.toggle_active = false
+flick_runtime.previous_key = false
+end
+
+local function apply_rage()
+rage_runtime_active = true
+rage.override_enabled(true)
+
+local damage_value = min_damage:get()
+local hitchance_value = hitchance:get()
+if weapon_profiles:get() and is_sniper_weapon() then
+damage_value = sniper_damage:get()
+hitchance_value = sniper_hitchance:get()
+end
+
+rage.override_min_damage(clamp(damage_value, 1, 130))
+rage.override_hitchance(clamp(hitchance_value, 0, 100))
+rage.override_target_selection(target_selection:get())
+
+local preset = hitbox_preset:get()
+rage.override_hitboxes(HITBOX_PRESETS[preset] or HITBOX_PRESETS["Head + chest"])
+rage.override_hitbox_priority(HITBOX_PRIORITIES[preset] or HITBOX_PRIORITIES["Head + chest"])
+rage.override_force_baim(force_baim:get())
+rage.override_force_safe_point(force_safe:get())
+end
+
+local function reset_rage()
+if rage_runtime_active then
+rage.reset()
+rage_runtime_active = false
+end
+end
+
+local function apply_resolver()
+resolver_runtime_active = true
+rage.set_resolver_enabled(true)
+rage.set_resolver_mode(resolver_mode:get())
+rage.set_resolver_miss_limit(clamp(resolver_miss_limit:get(), 1, 5))
+rage.set_resolver_baim_after_misses(clamp(resolver_baim_after:get(), 0, 5))
+end
+
+local function restore_resolver()
+if not resolver_runtime_active then
+return
+end
+
+rage.set_resolver_enabled(original_resolver.enabled)
+rage.set_resolver_mode(original_resolver.mode)
+rage.set_resolver_miss_limit(original_resolver.miss_limit)
+rage.set_resolver_baim_after_misses(original_resolver.baim_after)
+resolver_runtime_active = false
+end
+
+local function apply_auto_scope()
+if auto_scope_reference == nil then
+return
+end
+
+auto_scope_applied = true
+pcall(ui.set, auto_scope_reference, auto_scope:get() == true)
+end
+
+local function restore_auto_scope()
+if auto_scope_reference ~= nil and auto_scope_applied then
+pcall(ui.set, auto_scope_reference, original_auto_scope)
+end
+auto_scope_applied = false
+end
+
+local function restore_auto_duck()
+if auto_duck_reference ~= nil and auto_duck_applied then
+pcall(ui.set, auto_duck_reference, original_auto_duck)
+end
+auto_duck_applied = false
+end
+
+local function update_movement_choke(tick)
+local blocked_by_state = current_state_override and state_disable_fake_lag:get()
+local moving = current_speed >= clamp(autostop_min_speed:get(), 1, 200)
+local active = autostop_enabled:get() and moving and not blocked_by_state
+
+if not active then
+if movement_choke_active then
+aa.flush_choked()
+if not aa_enabled:get() then
+aa.override_fake_lag(false)
+end
+end
+movement_choke_active = false
+movement_choke_started = tick
+restore_auto_duck()
+return
+end
+
+if not movement_choke_active then
+movement_choke_active = true
+movement_choke_started = tick
+end
+
+aa_runtime_active = true
+aa.override_fake_lag(true)
+aa.override_fake_lag_limit(clamp(autostop_choke_ticks:get(), 1, 14))
+
+if autostop_duck:get() and auto_duck_reference ~= nil then
+pcall(ui.set, auto_duck_reference, true)
+auto_duck_applied = true
+else
+restore_auto_duck()
+end
+
+if tick - movement_choke_started >= clamp(autostop_choke_ticks:get(), 1, 14) then
+aa.flush_choked()
+movement_choke_started = tick
+end
+end
+
+local function clear_resolver_overrides()
+if resolver_overrides_applied then
+pcall(plist.reset_all)
+end
+resolver_overrides_applied = false
+end
+
+local function apply_player_resolver_overrides()
+if not resolver_enabled:get() or not resolver_player_overrides:get() then
+clear_resolver_overrides()
+return
+end
+
+local enemies = call_or(nil, entity.get_enemies)
+if type(enemies) ~= "table" then
+enemies = {}
+end
+local baim_threshold = clamp(resolver_baim_after:get(), 0, 5)
+local force_body = force_baim:get() == true
+
+for _, enemy in ipairs(enemies) do
+if call_or(false, entity.is_alive, enemy) then
+local state = get_resolver_target_state(enemy)
+
+if state.freestand == nil and resolver_freestand_seed:get() then
+state.freestand = detect_enemy_freestand(enemy)
+if state.freestand == "left" then
+state.stage = 0
+elseif state.freestand == "right" then
+state.stage = 1
+else
+state.stage = 2
+end
+end
+
+if resolver_lock_on_hit:get() and state.locked_yaw ~= nil then
+pcall(plist.set, enemy, "Force body yaw", true)
+pcall(plist.set, enemy, "Force body yaw value", state.locked_yaw)
+state.lock_applied = true
+else
+if state.lock_applied then
+pcall(rage.reset_player, enemy)
+state.lock_applied = false
+end
+pcall(plist.set, enemy, "Force body yaw", true)
+local offset = sample_timed_sequence(resolver_sequence_data, state.stage)
+pcall(plist.set, enemy, "Override yaw offset", normalized_angle(offset))
+end
+
+local baim = force_body or (baim_threshold > 0 and state.misses >= baim_threshold)
+pcall(plist.set, enemy, "Override prefer body aim", baim and "Force" or "-")
+pcall(
+plist.set,
+enemy,
+"Override safe point",
+baim and resolver_safe_on_baim:get() and "Force" or "-"
+)
+end
+end
+
+resolver_overrides_applied = true
+end
+
+local function disable_toolkit_runtime()
+if movement_choke_active then
+aa.flush_choked()
+end
+movement_choke_active = false
+restore_auto_duck()
+clear_resolver_overrides()
+reset_anti_aim()
+reset_rage()
+restore_resolver()
+restore_auto_scope()
+toolkit_active = false
+end
+
+local killstreak = 0
+local killstreak_hits = {}
+local killstreak_alive = {}
+local killstreak_local_alive = true
+local killstreak_text = nil
+
+local function killstreak_key(target)
+return target_key(get_target_slot(target) or target)
+end
+
+local function killstreak_reset()
+killstreak = 0
+killstreak_hits = {}
+killstreak_alive = {}
+end
+
+local function killstreak_draw()
+if killstreak_text ~= nil then
+return killstreak_text
+end
+
+pcall(function()
+local object = Drawing.new("Text")
+object.Size = 24
+object.Color = Color3.fromRGB(255, 255, 255)
+object.Outline = true
+object.Visible = false
+pcall(function()
+object.Font = Drawing.Fonts.Plex
+end)
+pcall(function()
+object.Center = true
+end)
+pcall(function()
+object.ZIndex = 20
+end)
+killstreak_text = object
+end)
+
+return killstreak_text
+end
+
+killstreak_draw()
+
+local function render_killstreak()
+local object = killstreak_draw()
+if object == nil then
+return
+end
+
+local width = 1920
+local height = 1080
+local ok, screen_width, screen_height = pcall(render.screen_size)
+if ok and type(screen_width) == "number" and type(screen_height) == "number"
+and screen_width > 0 and screen_height > 0 then
+width = screen_width
+height = screen_height
+end
+
+local visible = master:get()
+local label = string.format("Killstreak %d ", killstreak)
+
+pcall(function()
+object.Text = label
+object.Position = Vector2.new(width * 0.5, height - 110)
+object.Visible = visible
+end)
+end
+
+local function update_killstreak(tick)
+local player = call_or(nil, entity.get_local_player)
+local local_alive = player ~= nil and call_or(false, entity.is_alive, player) == true
+
+if killstreak_local_alive and not local_alive then
+killstreak_reset()
+end
+killstreak_local_alive = local_alive
+
+local enemies = call_or(nil, entity.get_enemies)
+if type(enemies) ~= "table" then
+return
+end
+
+for _, enemy in ipairs(enemies) do
+local key = killstreak_key(enemy)
+local alive = call_or(false, entity.is_alive, enemy) == true
+
+if killstreak_alive[key] == true and not alive then
+local hit_tick = killstreak_hits[key]
+if hit_tick ~= nil and tick - hit_tick <= 128 then
+killstreak = killstreak + 1
+end
+killstreak_hits[key] = nil
+end
+
+killstreak_alive[key] = alive
+end
+end
+
+events.on_tick(function(tick)
+update_killstreak(tick)
+
+if not master:get() then
+if toolkit_active then
+disable_toolkit_runtime()
+end
+return
+end
+
+toolkit_active = true
+update_local_snapshot()
+
+if aa_enabled:get() then
+apply_anti_aim(tick)
+else
+reset_anti_aim()
+end
+update_movement_choke(tick)
+
+if rage_enabled:get() then
+apply_rage()
+else
+reset_rage()
+end
+
+apply_auto_scope()
+
+if resolver_enabled:get() then
+apply_resolver()
+apply_player_resolver_overrides()
+else
+clear_resolver_overrides()
+restore_resolver()
+end
+end)
+
+client.set_event_callback("aim_fire", function(event)
+if not master:get() then
+return
+end
+
+if event ~= nil and event.id ~= nil then
+pending_shots[event.id] = {
+target = event.target,
+resolved_yaw = event.resolved_yaw
+}
+end
+
+if unchoke_on_shot:get() and aa_runtime_active then
+aa.unchoke()
+end
+if movement_choke_active then
+aa.flush_choked()
+movement_choke_started = call_or(0, globals.tickcount)
+end
+
+end)
+
+client.set_event_callback("aim_hit", function(event)
+if not master:get() then
+return
+end
+
+local target = event and event.target
+target_misses[target_key(target)] = 0
+
+if target ~= nil then
+local state = get_resolver_target_state(target)
+killstreak_hits[killstreak_key(target)] = call_or(0, globals.tickcount)
+state.hits = state.hits + 1
+state.misses = 0
+if resolver_reset_on_hit:get() then
+state.stage = 0
+end
+
+if resolver_lock_on_hit:get() then
+local shot = event.id ~= nil and pending_shots[event.id] or nil
+local resolved = shot and tonumber(shot.resolved_yaw) or nil
+if resolved == nil then
+local current = call_or(nil, rage.get_target)
+resolved = current and tonumber(current.resolved_yaw_deg) or nil
+end
+state.locked_yaw = resolved and normalized_angle(resolved) or state.locked_yaw
+end
+end
+if event ~= nil and event.id ~= nil then
+pending_shots[event.id] = nil
+end
+
+end)
+
+client.set_event_callback("aim_miss", function(event)
+if not master:get() then
+return
+end
+
+local target = event and event.target
+local key = target_key(target)
+target_misses[key] = (target_misses[key] or 0) + 1
+
+if event ~= nil and event.reason == "resolver" then
+local state = get_resolver_target_state(target)
+state.misses = state.misses + 1
+state.locked_yaw = nil
+
+local miss_limit = math.max(1, math.floor(resolver_miss_limit:get()))
+if state.misses % miss_limit == 0 then
+state.stage = state.stage + 1
+end
+end
+if event ~= nil and event.id ~= nil then
+pending_shots[event.id] = nil
+end
+
+end)
 
 client.set_event_callback("paint", function()
-    if not U.master:get() then hide_all(); return end
-    local rt = clock()
-    if rt < h_next then return end
-    h_next = rt + 0.15
-
-    local secs, n = {}, 0
-    for i = 1, #HUDS do
-        if show[i]:get() then
-            local ok, s = pcall(HUDS[i].fn)
-            if ok and s then n = n + 1; secs[n] = s end
-        end
-    end
-    if n == 0 then hide_all(); return end
-
-    local x, y, sz, al = floor(U.x:get()), floor(U.y:get()), floor(U.size:get()), U.alpha:get() / 100
-    local alive = ME.alive and true or false
-
-    local sg = { x, y, sz, al, tostring(alive) }
-    local m = #sg
-    for i = 1, n do
-        local s = secs[i]
-        m = m + 1; sg[m] = s.title
-        for j = 1, #s.rows do
-            local r = s.rows[j]
-            m = m + 1
-            sg[m] = tostring(r[1]) .. "\2" .. tostring(r[2]) .. "\2" .. tostring(r[3]) .. "\2" .. tostring(r[4] and floor(r[4] * 100) or "")
-        end
-    end
-    local sig = table.concat(sg, "\1")
-    if sig == h_sig and h_vis then return end
-    h_sig, h_vis = sig, true
-
-    local ok, e = pcall(layout, secs, x, y, sz, al, alive)
-    if not ok and not h_err then h_err = true; print("[hvh] hud layout error: " .. tostring(e)) end
-end)
-
--- единственный on_tick: AA -> Resolver -> HC
-events.on_tick(function()
-    update_me(clock())
-    for i = 1, #TICKS do TICKS[i]() end
+pcall(render_killstreak)
+pcall(render_madness_body)
 end)
 
 client.set_event_callback("shutdown", function()
-    for i = 1, #STOPS do pcall(STOPS[i]) end
-    for i = 1, #TXT do pcall(function() TXT[i]:Destroy() end) end
-    for i = 1, #SQR do pcall(function() SQR[i]:Destroy() end) end
-    pcall(function() bg:Destroy(); hdr:Destroy(); dot:Destroy() end)
-    render.clear()
+save_config()
+disable_toolkit_runtime()
 end)
 
-print("[hvh] lite v9.1 loaded")
-if notify then notify("HVH Lite v9.1", "AA + Resolver + Smart HC loaded", 2, false) end
-end -- PART 4
+load_config()
+print(“Blessed HvH loaded | t.me/blessedlua”)
